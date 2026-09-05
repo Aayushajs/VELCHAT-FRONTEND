@@ -1,4 +1,4 @@
-import { chunk, mapChunked, DEFAULT_CHUNK_SIZE } from '../chunk';
+import { chunk, mapChunked, whenIdle, DEFAULT_CHUNK_SIZE } from '../chunk';
 
 /** Synchronous stand-in for the real macrotask yield — tests assert slicing, never timing. */
 const noYield = (): Promise<void> => Promise.resolve();
@@ -105,5 +105,32 @@ describe('mapChunked', () => {
     }, 0);
     await mapChunked([1, 2, 3, 4], n => n, { size: 1 });
     expect(timerRan).toBe(true);
+  });
+});
+
+describe('whenIdle', () => {
+  const g = globalThis as {
+    requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => unknown;
+  };
+  const original = g.requestIdleCallback;
+  afterEach(() => {
+    if (original === undefined) delete g.requestIdleCallback;
+    else g.requestIdleCallback = original;
+  });
+
+  it('prefers requestIdleCallback and passes a timeout so it always fires', async () => {
+    const seen: ({ timeout: number } | undefined)[] = [];
+    g.requestIdleCallback = (cb, o) => {
+      seen.push(o);
+      cb();
+      return 1;
+    };
+    await whenIdle(250);
+    expect(seen).toEqual([{ timeout: 250 }]);
+  });
+
+  it('still resolves when the runtime has no requestIdleCallback', async () => {
+    delete g.requestIdleCallback;
+    await expect(whenIdle()).resolves.toBeUndefined();
   });
 });

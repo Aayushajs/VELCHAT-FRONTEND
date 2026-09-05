@@ -24,7 +24,6 @@
  * PRIVACY: never log a name or number — only counts.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { InteractionManager } from 'react-native';
 import {
   checkContactsPermission,
   ensureContactsPermission,
@@ -41,7 +40,7 @@ import {
 } from '../../../infra';
 import { discoverContacts } from '../../../domain';
 import { contactFingerprint, hashFingerprints } from '../model/fingerprint';
-import { mapChunked } from '../model/chunk';
+import { mapChunked, whenIdle } from '../model/chunk';
 import {
   buildContactLists,
   normalizeContact,
@@ -410,9 +409,13 @@ export async function prewarmContacts(): Promise<void> {
     if (cached && !cached.pending && Date.now() - cached.at < CACHE_TTL_MS) {
       return;
     }
-    await new Promise<void>(resolve => {
-      InteractionManager.runAfterInteractions(() => resolve());
-    });
+    await whenIdle();
+    // Another caller (the screen's own load) may have finished the whole pipeline while this one
+    // waited for idle. Re-check before spending a second address-book read on the same answer.
+    const settled = readCache(getAccountId());
+    if (settled && !settled.pending && Date.now() - settled.at < CACHE_TTL_MS) {
+      return;
+    }
     const res = await runPipeline(() => false);
     if (!res) return;
     const snap = res.snapshot;
@@ -469,9 +472,7 @@ export function useDeviceContacts(): UseDeviceContacts {
       // A silent refresh is invisible work behind a painted list — hold it until the screen has
       // settled so it can never compete with the open transition.
       if (silent) {
-        await new Promise<void>(resolve => {
-          InteractionManager.runAfterInteractions(() => resolve());
-        });
+        await whenIdle();
         if (stale()) return;
       }
 

@@ -102,6 +102,17 @@ export function observeConversation(
     .observeWithColumns(['name', 'peer_id', 'peer_avatar_url']);
 }
 
+/** The DM peer stored on the row, if the inbox sync has resolved one. No network. */
+export async function peerIdFor(
+  conversationId: string,
+): Promise<string | undefined> {
+  const row = await getDatabase()
+    .get<Conversation>('conversations')
+    .find(conversationId)
+    .catch(() => null);
+  return row?.peerId;
+}
+
 /**
  * How old the cached peer name/photo is, in ms — `null` when we have never resolved one.
  * Drives revalidation: fast render from the row, corrected in the background when it goes stale.

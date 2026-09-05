@@ -61,6 +61,7 @@ export {
   clearUnread,
   upsertConversation,
   peerIdentityAgeMs,
+  peerIdFor,
   observeConversation,
   purgeAllLocalChat,
   observeMessages,

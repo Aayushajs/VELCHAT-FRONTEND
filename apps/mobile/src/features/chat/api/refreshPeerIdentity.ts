@@ -18,10 +18,11 @@ import {
 import { getProfile, getMediaUrl } from '../../user';
 
 /**
- * How long a cached name/photo is trusted. Long enough that opening chats all day costs nothing;
- * short enough that a changed picture shows up the same session.
+ * How long a cached name/photo is trusted. The cost of being wrong is a peer's new picture taking
+ * up to this long to appear, and the cost of being aggressive is one profile request per opened
+ * chat — so this is bounded by chats the user actually opens, never by list size or scrolling.
  */
-const IDENTITY_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const IDENTITY_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 /** Conversations already revalidated this run — one attempt per app session per conversation. */
 const attempted = new Set<string>();

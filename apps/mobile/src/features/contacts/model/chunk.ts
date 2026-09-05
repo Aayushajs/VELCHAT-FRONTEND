@@ -28,6 +28,35 @@ export function yieldToEventLoop(): Promise<void> {
   });
 }
 
+/**
+ * Wait until the JS thread has nothing better to do, then continue.
+ *
+ * Used to keep whole-book work (the launch prewarm, a silent refresh behind an already-painted
+ * list) out of the frames that matter — cold start (§R4 ≤2.0 s) and the New Chat open transition.
+ *
+ * `requestIdleCallback` rather than `InteractionManager`: the latter is deprecated in RN 0.86 and
+ * warns on every access. The `timeout` guarantees the work still runs on a device that never goes
+ * idle, and the `setTimeout` fallback covers environments without the polyfill (Jest, and any
+ * runtime where the global is missing).
+ */
+export function whenIdle(timeoutMs = 1000): Promise<void> {
+  return new Promise(resolve => {
+    const ric = (
+      globalThis as {
+        requestIdleCallback?: (
+          cb: () => void,
+          opts?: { timeout: number },
+        ) => unknown;
+      }
+    ).requestIdleCallback;
+    if (typeof ric === 'function') {
+      ric(() => resolve(), { timeout: timeoutMs });
+      return;
+    }
+    setTimeout(resolve, 0);
+  });
+}
+
 export interface ChunkedOptions {
   /** Items per slice. Smaller = smoother, more overhead. */
   size?: number;

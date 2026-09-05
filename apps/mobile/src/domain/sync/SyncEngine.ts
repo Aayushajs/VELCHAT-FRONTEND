@@ -58,6 +58,7 @@ import {
   listConversationIds,
   clearUnread,
   upsertConversation,
+  peerIdFor,
   pendingReceiptFrames,
   getDesired,
   getSent,
@@ -980,13 +981,21 @@ class SyncEngine {
     const me = getAccountId();
     if (!me) return null;
     let peerId: string | null = null;
-    try {
-      const members = await getConversationMembers(conversationId);
-      const others = members.filter(m => m !== me);
-      peerId = others.length === 1 ? (others[0] ?? null) : null;
-    } catch (e) {
-      log.warn('presence members resolve failed', { reason: String(e) });
-      return null;
+    // The inbox sync already resolved this DM's peer onto the row, so opening a chat should not
+    // pay a members round-trip to learn something we stored. Falling back to the network only
+    // covers a conversation that arrived before that field existed (or a group).
+    const stored = await peerIdFor(conversationId).catch(() => undefined);
+    if (stored) {
+      peerId = stored;
+    } else {
+      try {
+        const members = await getConversationMembers(conversationId);
+        const others = members.filter(m => m !== me);
+        peerId = others.length === 1 ? (others[0] ?? null) : null;
+      } catch (e) {
+        log.warn('presence members resolve failed', { reason: String(e) });
+        return null;
+      }
     }
     if (peerId === null) return null;
     this.activePresencePeers.set(conversationId, peerId);
