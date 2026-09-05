@@ -32,6 +32,7 @@ export type {
   PresenceEntry,
   TypingEntry,
 } from './realtimeStore';
+export { connectionBanner, BANNER_GRACE_MS } from './connectionBanner';
 export {
   recordLatency,
   timed,
@@ -41,3 +42,4 @@ export {
   resetLatency,
 } from './perf/latency';
 export type { LatencySpan, LatencyStats } from './perf/latency';
+export type { BannerKind, BannerInput } from './connectionBanner';

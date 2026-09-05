@@ -25,6 +25,7 @@ import {
   RealtimeSocket,
   WS_CODE_UNAUTHORIZED,
   hasSession,
+  subscribeSession,
   getAccessToken,
   refreshAccessToken,
   getAccountId,
@@ -47,6 +48,7 @@ import {
   maxSeqForConversation,
   minSeqForConversation,
   applyReceipt,
+  parseReceiptFrame,
   enqueueOptimisticSend,
   claimNextDue,
   markAckd,
@@ -108,6 +110,7 @@ class SyncEngine {
   private socket: RealtimeSocket | null = null;
   private netUnsub: (() => void) | null = null;
   private appStateUnsub: (() => void) | null = null;
+  private sessionUnsub: (() => void) | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private outboxTimer: ReturnType<typeof setTimeout> | null = null;
   private receiptTimer: ReturnType<typeof setTimeout> | null = null;
@@ -226,6 +229,19 @@ class SyncEngine {
       log.warn('outbox recovery failed', { reason: String(e) });
     });
     this.netUnsub = subscribeNetwork(s => this.onNetwork(s.connected));
+    // A sign-in that happens while the app is ALREADY RUNNING is the case this engine could
+    // not previously see: `connect()` refuses to open a socket without a session, and it only
+    // re-arms on a network/foreground transition — neither of which a login causes. So the
+    // socket stayed shut for the rest of the run and the user received nothing (no messages,
+    // no receipts → no ticks, no presence) until they force-quit. Now the session itself tells us.
+    this.sessionUnsub = subscribeSession(present => {
+      if (this.stopped) return;
+      if (present) {
+        this.onSessionEstablished();
+      } else {
+        this.onSessionCleared();
+      }
+    });
     // §8 addendum: detect background→foreground transitions. If the socket died silently
     // while backgrounded (common on iOS), NetInfo doesn't fire — this catches it.
     this.appStateUnsub = subscribeAppState(s => {
@@ -250,6 +266,12 @@ class SyncEngine {
   stop(): void {
     this.stopped = true;
     this.started = false;
+    // Forget the connectivity of the session that just ended. `connect()` only fires on a
+    // TRANSITION to online, and `start()` seeds that from a fresh NetInfo read — so a remembered
+    // `true` makes the seed look like "no change" and the next session runs with NO socket at all:
+    // no inbound messages, no ticks, no presence, until the app is force-quit. `stopSync`/
+    // `startSync` bracket the authenticated session, so this is precisely the sign-out → sign-in path.
+    this.online = false;
     if (this.netUnsub) {
       this.netUnsub();
       this.netUnsub = null;
@@ -257,6 +279,10 @@ class SyncEngine {
     if (this.appStateUnsub) {
       this.appStateUnsub();
       this.appStateUnsub = null;
+    }
+    if (this.sessionUnsub) {
+      this.sessionUnsub();
+      this.sessionUnsub = null;
     }
     this.clearReconnectTimer();
     this.clearOutboxTimer();
@@ -308,6 +334,40 @@ class SyncEngine {
       this.connect();
     }
     this.kickOutbox();
+  }
+
+  /**
+   * The user just signed in (in-session), so everything that was gated on "no session" can now
+   * run. Reset the backoff/refresh budgets first: attempts accumulated while signed out say
+   * nothing about this fresh, known-good token, and leaving them set would delay the first
+   * connect by the tail of an old backoff.
+   */
+  private onSessionEstablished(): void {
+    log.info('session established: connecting realtime');
+    this.reconnectAttempts = 0;
+    this.authRefreshAttempts = 0;
+    this.clearReconnectTimer();
+    this.connect();
+    this.kickOutbox();
+  }
+
+  /**
+   * Signed out (or the session was revoked). Drop the socket rather than let it keep running on
+   * a token that is gone — the gateway would close it as 4001 anyway, and the recovery path
+   * would then burn its refresh budget trying to revive a session that no longer exists.
+   */
+  private onSessionCleared(): void {
+    log.info('session cleared: releasing realtime');
+    this.clearReconnectTimer();
+    this.clearAllTyping();
+    this.activeConversationId = null;
+    this.gapProbedFrom.clear();
+    this.namedPeers.clear();
+    this.activePresencePeers.clear();
+    const s = this.socket;
+    this.socket = null;
+    s?.close();
+    this.setConnState('disconnected');
   }
 
   // ── socket lifecycle ─────────────────────────────────────────────────────
@@ -747,29 +807,13 @@ class SyncEngine {
   }
 
   private async onInboundReceipt(data: unknown): Promise<void> {
-    const d =
-      data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
-    const conversationId =
-      typeof d.conversationId === 'string'
-        ? d.conversationId
-        : typeof d.conversation_id === 'string'
-          ? d.conversation_id
-          : undefined;
-    const seqRaw = d.upToSeq ?? d.up_to_seq ?? d.seq;
-    const upToSeq = typeof seqRaw === 'number' ? seqRaw : Number(seqRaw);
-    const state =
-      d.state === 'read'
-        ? 'read'
-        : d.state === 'delivered'
-          ? 'delivered'
-          : undefined;
-    if (
-      conversationId === undefined ||
-      !Number.isFinite(upToSeq) ||
-      state === undefined
-    ) {
-      return;
-    }
+    // Parsing + the self-echo filter are pure and unit-tested (`parseReceiptFrame`). The
+    // gateway fans a receipt to EVERY member including the acknowledger, so without that
+    // filter our own `read` — emitted the instant we open a chat — came back and turned our
+    // OWN bubbles blue, making the ticks describe us rather than the peer.
+    const r = parseReceiptFrame(data, getAccountId());
+    if (!r) return;
+    const { conversationId, upToSeq, state } = r;
     // Remember it even if it matches nothing right now: a receipt for messages we have not
     // backfilled yet used to evaporate, leaving permanent grey ticks on messages the peer had
     // already read. The backfill re-applies this watermark once those rows exist.
