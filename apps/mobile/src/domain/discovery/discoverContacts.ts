@@ -19,9 +19,11 @@
  * §M7 ownership: no timers/sockets/listeners — a single async pipeline; all buffers are
  * bounded by the caller's contact-list size (no unbounded cache).
  *
- * NOTE (§M0.4, follow-up): the BigInt blinding math runs on the JS thread here. For large
- * contact lists this should be moved to a worker / scheduled via InteractionManager to
- * avoid jank; that off-thread offload is a separate increment (see task scope).
+ * PERF (§M0.4): the BigInt math still runs on the JS thread, but it no longer BLOCKS it. The
+ * blinding pass is sliced with a macrotask yield between slices (so the longest single block is
+ * one slice, not the whole address book), and unblinding inverts the entire batch with ONE
+ * modular inverse instead of one per contact (`unblindBatch`; ~13x on that step, measured).
+ * A true off-thread offload (JSI/worker) remains a later increment.
  *
  * PRIVACY: never log phone numbers or tokens — only counts.
  */
@@ -38,14 +40,24 @@ import {
   oprfMatch,
   oprfRegister,
   oprfRegisterEdges,
+  mapYielding,
   parseOprfPublicKey,
   toE164,
-  unblind,
+  unblindBatch,
   OPRF_EVALUATE_BATCH_CAP,
   OPRF_MATCH_BATCH_CAP,
   type BlindResult,
   type OprfPublicKey,
 } from '../../infra';
+
+/**
+ * Contacts per blinding slice. One blind is a 2048-bit modexp (~0.33 ms on desktop V8, several
+ * times that on the reference device), so ~50 keeps a slice near one frame's budget while
+ * keeping the yield overhead negligible against the whole pass.
+ */
+const BLIND_CHUNK_SIZE = 50;
+/** base64url encode/decode is far cheaper than a modexp, so slices can be much larger. */
+const WIRE_CHUNK_SIZE = 500;
 
 function chunk<T>(items: readonly T[], size: number): T[][] {
   const out: T[][] = [];
@@ -65,8 +77,27 @@ async function tokenizeInputs(
   inputs: readonly string[],
   pub: OprfPublicKey,
 ): Promise<Map<string, string>> {
-  const blinds: BlindResult[] = inputs.map(input => blind(input, pub));
-  const blindedWire = blinds.map(b => bigIntToBase64Url(b.blinded));
+  // Blinding is CHUNKED, not one `.map`. It is a per-contact modular exponentiation over a
+  // 2048-bit modulus, and the discovery budget is ~2000 numbers, so running it to completion in
+  // one turn froze the JS thread for the whole pass — every frame inside it dropped, which is
+  // what the slow "importing contacts" screen actually was. Slicing caps the longest single
+  // block at one slice; total CPU is unchanged.
+  const blinds: BlindResult[] | null = await mapYielding(
+    inputs,
+    input => blind(input, pub),
+    { size: BLIND_CHUNK_SIZE },
+  );
+  if (blinds === null) {
+    throw new AppError('client', 'discovery: blinding cancelled');
+  }
+  const blindedWire = await mapYielding(
+    blinds,
+    b => bigIntToBase64Url(b.blinded),
+    { size: WIRE_CHUNK_SIZE },
+  );
+  if (blindedWire === null) {
+    throw new AppError('client', 'discovery: blinding cancelled');
+  }
 
   const evaluatedWire: string[] = [];
   for (const batch of chunk(blindedWire, OPRF_EVALUATE_BATCH_CAP)) {
@@ -80,14 +111,31 @@ async function tokenizeInputs(
     throw new AppError('server', 'discovery: evaluate/input length mismatch');
   }
 
+  // Decode off the critical block too, then unblind the WHOLE batch with ONE modular inverse
+  // (Montgomery's trick — see `batchModInverse`). Per-contact `modInverse` was ~two thirds of
+  // the entire crypto cost; batching it measured ~13x faster and is bit-identical, with each
+  // contact keeping its own independent blinding factor.
+  const evaluated = await mapYielding(
+    evaluatedWire,
+    wire => base64UrlToBigInt(wire),
+    { size: WIRE_CHUNK_SIZE },
+  );
+  if (evaluated === null) {
+    throw new AppError('client', 'discovery: decode cancelled');
+  }
+  const tokens = unblindBatch(
+    evaluated,
+    blinds.map(b => b.r),
+    pub,
+  );
+
   const tokenByInput = new Map<string, string>();
   for (const [i, input] of inputs.entries()) {
-    const b = blinds[i];
-    const ev = evaluatedWire[i];
-    if (b === undefined || ev === undefined) {
+    const token = tokens[i];
+    if (token === undefined) {
       throw new AppError('server', 'discovery: response misaligned');
     }
-    tokenByInput.set(input, unblind(base64UrlToBigInt(ev), b.r, pub));
+    tokenByInput.set(input, token);
   }
   return tokenByInput;
 }

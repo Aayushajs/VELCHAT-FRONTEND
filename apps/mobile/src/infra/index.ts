@@ -19,6 +19,10 @@ export {
   fetchInbox,
   getPresence,
   subscribePresence,
+  presenceOnline,
+  presenceOffline,
+  presenceHeartbeat,
+  PRESENCE_ONLINE_TTL_MS,
   normalizePresenceEvent,
   AppError,
   isAppError,
@@ -31,6 +35,7 @@ export {
   hasSession,
   setTokens,
   clearSession,
+  subscribeSession,
   getOprfKey,
   oprfEvaluate,
   oprfRegister,
@@ -95,6 +100,8 @@ export {
   fetchConversationNames,
   sanitizeLikeQuery,
   pendingReceiptFrames,
+  parseReceiptFrame,
+  dmConversationId,
   mergeWatermark,
   EMPTY_WATERMARKS,
   getDesired,
@@ -139,6 +146,8 @@ export {
   bigIntToBase64Url,
   base64UrlToBigInt,
   randomBigIntBelow,
+  batchModInverse,
+  unblindBatch,
 } from './crypto';
 export type { OprfPublicKey, BlindResult } from './crypto';
 export {
@@ -167,4 +176,4 @@ export type {
   ContactsAccess,
   AppStateStatus,
 } from './native';
-export { toE164, regionFromE164 } from './util';
+export { toE164, regionFromE164, yieldToEventLoop, mapYielding } from './util';

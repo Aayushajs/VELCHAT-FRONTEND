@@ -24,5 +24,7 @@ export {
   bigIntToBase64Url,
   base64UrlToBigInt,
   randomBigIntBelow,
+  batchModInverse,
+  unblindBatch,
 } from './oprf';
 export type { OprfPublicKey, BlindResult } from './oprf';

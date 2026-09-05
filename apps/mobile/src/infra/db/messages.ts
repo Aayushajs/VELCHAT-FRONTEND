@@ -199,7 +199,7 @@ export async function applyServerMessages(
   const seqs = sorted.map(s => s.seq);
   const convIds = [...new Set(sorted.map(s => s.conversationId))];
 
-  const [existingByClient, existingBySeq] = await Promise.all([
+  const [existingByClient, existingBySeq, existingConvs] = await Promise.all([
     clientIds.length > 0
       ? msgs.query(Q.where('client_msg_id', Q.oneOf(clientIds))).fetch()
       : Promise.resolve([] as Message[]),
@@ -209,7 +209,15 @@ export async function applyServerMessages(
         Q.where('seq', Q.oneOf(seqs)),
       )
       .fetch(),
+    // Resolved UP FRONT, outside the write. WatermelonDB requires every prepared operation to
+    // reach `batch()` synchronously; awaiting a conversation lookup after the message rows were
+    // already prepared breaks that invariant ("wasn't sent to batch() synchronously — this is
+    // bad!") and can drop those prepared writes, which is an inbound message that silently never
+    // persists. One query for the batch also replaces a find() per conversation.
+    convs.query(Q.where('id', Q.oneOf(convIds))).fetch(),
   ]);
+  const convById = new Map<string, Conversation>();
+  for (const c of existingConvs) convById.set(c.id, c);
 
   const byClientId = new Map<string, Message>();
   for (const row of existingByClient) {
@@ -281,7 +289,7 @@ export async function applyServerMessages(
       }
     }
     for (const [convId, b] of bumps) {
-      const conv = await convs.find(convId).catch(() => null);
+      const conv = convById.get(convId);
       if (conv) {
         ops.push(
           conv.prepareUpdate(c => {

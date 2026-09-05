@@ -29,9 +29,13 @@ import {
   getAccessToken,
   refreshAccessToken,
   getAccountId,
+  getDeviceId,
   getConversationMembers,
   getPresence,
   subscribePresence,
+  presenceOnline,
+  presenceOffline,
+  presenceHeartbeat,
   normalizePresenceEvent,
   subscribeNetwork,
   getNetworkStatus,
@@ -105,6 +109,21 @@ const MAX_BACKFILL_PAGES = 100;
  * that a phone in a pocket is never holding a socket open.
  */
 const BACKGROUND_SUSPEND_DELAY_MS = 30_000;
+/**
+ * How often we refresh our OWN presence server-side. Must be comfortably inside the server's
+ * `PRESENCE_ONLINE_TTL_MS` (30 s) `online:{userId}` TTL or we flicker offline while still connected; 20 s leaves room for
+ * one lost request. The realtime gateway never reports our socket to the presence service (its
+ * `ping` refreshes only its own connection registry), so if the client doesn't do this, nobody
+ * does — which is why every peer appeared offline regardless of what they were doing.
+ */
+const PRESENCE_HEARTBEAT_MS = 20_000;
+/**
+ * How often the OPEN chat re-reads its peer's presence. The gateway fans no `presence.changed`
+ * frame to sockets, so there is no push to wait for: a one-shot read at chat-open was simply a
+ * snapshot that went stale seconds later and never recovered. Also re-subscribes, since the
+ * server's `subscribers:{u}` set expires after 300 s.
+ */
+const PEER_PRESENCE_POLL_MS = 20_000;
 
 class SyncEngine {
   private socket: RealtimeSocket | null = null;
@@ -115,6 +134,11 @@ class SyncEngine {
   private outboxTimer: ReturnType<typeof setTimeout> | null = null;
   private receiptTimer: ReturnType<typeof setTimeout> | null = null;
   private suspendTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Owned timers for the presence pair: our own keepalive, and the open chat's peer refresh. */
+  private presenceTimer: ReturnType<typeof setInterval> | null = null;
+  private peerPresenceTimer: ReturnType<typeof setInterval> | null = null;
+  /** True once we have told the server this device is online (so we only say "offline" if so). */
+  private presenceAnnounced = false;
   /** True while the app is backgrounded and the socket has been deliberately released. */
   private suspended = false;
   /**
@@ -151,6 +175,13 @@ class SyncEngine {
    * later message — only a cursor that actually moved earns another.
    */
   private readonly gapProbedFrom = new Map<string, number>();
+  /**
+   * In-flight "load older" per conversation. Two callers that both read the cursor before either
+   * writes will fetch the SAME page and insert it twice: the dedup in `applyServerMessages`
+   * decides from a read taken before its write, so concurrent applies each conclude the rows are
+   * new. A double-tap at the top of a chat is enough to produce it.
+   */
+  private readonly loadingOlder = new Map<string, Promise<boolean>>();
   /**
    * Resolves an account id to a display name. INJECTED by the feature layer (§M3: domain must
    * not import features), because a brand-new DM arrives as a bare account id and would
@@ -288,10 +319,13 @@ class SyncEngine {
     this.clearOutboxTimer();
     this.clearReceiptTimer();
     this.clearSuspendTimer();
+    this.clearPeerPresenceTimer();
+    this.stopSelfPresence();
     this.suspended = false;
     this.clearAllTyping();
     this.activeConversationId = null;
     this.gapProbedFrom.clear();
+    this.loadingOlder.clear();
     this.namedPeers.clear();
     this.activePresencePeers.clear();
     useRealtimeStore.getState().reset();
@@ -318,6 +352,8 @@ class SyncEngine {
       this.socket = null;
       s?.close();
       this.clearOutboxTimer();
+      this.clearPeerPresenceTimer();
+      this.stopSelfPresence();
     }
   }
 
@@ -360,6 +396,9 @@ class SyncEngine {
     log.info('session cleared: releasing realtime');
     this.clearReconnectTimer();
     this.clearAllTyping();
+    this.clearPeerPresenceTimer();
+    // Announce offline BEFORE the token disappears — afterwards the request would 401.
+    this.stopSelfPresence();
     this.activeConversationId = null;
     this.gapProbedFrom.clear();
     this.namedPeers.clear();
@@ -390,6 +429,9 @@ class SyncEngine {
         // The token is proven good — re-arm the 4001 refresh budget for the next expiry.
         this.authRefreshAttempts = 0;
         this.setConnState('connected');
+        // An open socket IS this device being online — and the ONLY thing that can tell the
+        // presence service so, because the gateway never reports it (see infra/network/presence).
+        this.startSelfPresence();
         log.info('ws open');
       },
       onConnected: () => {
@@ -429,6 +471,9 @@ class SyncEngine {
     this.socket = null;
     // Peers' "typing" is no longer trustworthy once the link drops — clear all indicators.
     this.clearAllTyping();
+    // The link is gone, so this device is no longer reachable: say so rather than let the TTL
+    // expire silently (which would leave the peer's "last seen" up to 30s wrong).
+    this.stopSelfPresence();
     log.info('ws closed', { code, reason });
     if (this.stopped) return;
     if (code === WS_CODE_UNAUTHORIZED) {
@@ -523,6 +568,10 @@ class SyncEngine {
       this.clearOutboxTimer();
       this.clearReceiptTimer();
       this.clearAllTyping();
+      this.clearPeerPresenceTimer();
+      // Backgrounded with the socket released = offline to everyone else. Announce it so the
+      // peer sees a real "last seen" instead of a user who never goes away.
+      this.stopSelfPresence();
       const s = this.socket;
       this.socket = null;
       s?.close();
@@ -722,6 +771,21 @@ class SyncEngine {
         }
       }
     }
+  }
+
+  /**
+   * Acknowledge inbound messages that some OTHER path restored (the inbox backfill at launch /
+   * after sign-in), so the sender's second tick appears.
+   *
+   * Needed because the engine's own catch-up asks only for messages past the local cursor: once
+   * `backfillInbox` has pulled a conversation's history, `backfillConversation` gets an empty
+   * page and its `noteDelivered` never runs. Messages that arrived while the user was signed out
+   * therefore sat on the recipient's device fully delivered while the sender kept one grey tick
+   * with nothing that could ever repair it. Cumulative + monotonic, so a duplicate call is free.
+   */
+  noteInboundDelivered(conversationId: string, seq: number): void {
+    if (!(seq > 0)) return;
+    this.noteDelivered(conversationId, seq);
   }
 
   /**
@@ -940,6 +1004,20 @@ class SyncEngine {
     conversationId: string,
     page: number,
   ): Promise<boolean> {
+    // Concurrent callers share ONE fetch — see `loadingOlder`.
+    const inFlight = this.loadingOlder.get(conversationId);
+    if (inFlight) return inFlight;
+    const work = this.fetchOlderMessages(conversationId, page).finally(() => {
+      this.loadingOlder.delete(conversationId);
+    });
+    this.loadingOlder.set(conversationId, work);
+    return work;
+  }
+
+  private async fetchOlderMessages(
+    conversationId: string,
+    page: number,
+  ): Promise<boolean> {
     const oldest = await minSeqForConversation(conversationId);
     if (oldest <= 1) return false; // seq 1 is the first message ever — nothing precedes it
     const from = Math.max(0, oldest - 1 - page);
@@ -1047,6 +1125,97 @@ class SyncEngine {
 
   // ── presence (§A15) ────────────────────────────────────────────────────────
   /**
+   * Tell the presence service this device is online and keep saying so.
+   *
+   * The realtime gateway is documented as the caller of `POST /presence/online` but never wires a
+   * presence client, and its inbound `ping` refreshes only its own connection registry — so
+   * before this, `online:{userId}` was never populated for ANY account and every peer read as
+   * offline no matter what they were doing. Idempotent: re-announcing is harmless (`SADD`).
+   */
+  private startSelfPresence(): void {
+    const me = getAccountId();
+    const device = getDeviceId();
+    if (!me || !device) return;
+    this.clearPresenceTimer();
+    this.presenceAnnounced = true;
+    void presenceOnline(me, device).catch((e: unknown) => {
+      log.warn('presence online failed', { reason: String(e) });
+    });
+    // Owned interval (§M7): refreshes inside the server's 30s TTL, disposed with the socket.
+    this.presenceTimer = setInterval(() => {
+      const uid = getAccountId();
+      if (!uid) return;
+      void presenceHeartbeat(uid).catch(() => undefined);
+    }, PRESENCE_HEARTBEAT_MS);
+  }
+
+  /**
+   * Tell the presence service this device is gone, and stop the keepalive. Called on every path
+   * that releases the socket (close, background suspend, sign-out, engine stop) so the peer sees
+   * an accurate "last seen" instead of a user who is online forever.
+   */
+  private stopSelfPresence(): void {
+    this.clearPresenceTimer();
+    if (!this.presenceAnnounced) return;
+    this.presenceAnnounced = false;
+    const me = getAccountId();
+    const device = getDeviceId();
+    if (!me || !device) return;
+    void presenceOffline(me, device).catch(() => undefined);
+  }
+
+  private clearPresenceTimer(): void {
+    if (this.presenceTimer !== null) {
+      clearInterval(this.presenceTimer);
+      this.presenceTimer = null;
+    }
+  }
+
+  private clearPeerPresenceTimer(): void {
+    if (this.peerPresenceTimer !== null) {
+      clearInterval(this.peerPresenceTimer);
+      this.peerPresenceTimer = null;
+    }
+  }
+
+  /** Read one peer's presence snapshot into the live store. Best-effort, never throws. */
+  private async refreshPeerPresence(peerId: string): Promise<void> {
+    const me = getAccountId();
+    if (!me) return;
+    try {
+      const p = await getPresence(peerId, me);
+      useRealtimeStore.getState().setPresence(peerId, {
+        status: normalizePresenceStatus(p.status),
+        lastSeen: p.lastSeen,
+      });
+    } catch (e) {
+      log.warn('presence fetch failed', { reason: String(e) });
+    }
+  }
+
+  /**
+   * Keep the OPEN chat's peer presence current. There is no `presence.changed` frame to wait for
+   * (the gateway's fan-out subscribes to message/receipt/caption only), so the snapshot has to be
+   * re-read: without this, a peer who came online AFTER the chat was opened stayed grey forever,
+   * and one who left stayed "online" forever. Re-subscribes each tick too, because the server's
+   * `subscribers:{u}` set expires after 300s.
+   */
+  private startPeerPresencePolling(peerId: string): void {
+    this.clearPeerPresenceTimer();
+    const me = getAccountId();
+    if (!me) return;
+    this.peerPresenceTimer = setInterval(() => {
+      // Only while we're actually in the foreground with a link — polling a suspended app would
+      // be exactly the overnight battery drain §M13 exists to prevent.
+      if (this.stopped || this.suspended || !this.online) return;
+      if (!this.activePresencePeers.has(this.activeConversationId ?? ''))
+        return;
+      void subscribePresence(me, [peerId]).catch(() => undefined);
+      void this.refreshPeerPresence(peerId);
+    }, PEER_PRESENCE_POLL_MS);
+  }
+
+  /**
    * A chat became active → resolve its DM peer (members − me), subscribe to the peer's live presence
    * (fan-out targets subscribers only), and fetch the current snapshot into the store. Returns the
    * peerId, or `null` for a group / note-to-self (no single-peer presence line). Never blocks the UI:
@@ -1078,21 +1247,18 @@ class SyncEngine {
     void subscribePresence(me, [peer]).catch((e: unknown) => {
       log.warn('presence subscribe failed', { reason: String(e) });
     });
-    try {
-      const p = await getPresence(peer, me);
-      useRealtimeStore.getState().setPresence(peer, {
-        status: normalizePresenceStatus(p.status),
-        lastSeen: p.lastSeen,
-      });
-    } catch (e) {
-      log.warn('presence fetch failed', { reason: String(e) });
-    }
+    await this.refreshPeerPresence(peer);
+    // The snapshot alone is a single point-in-time reading and there is no live presence frame
+    // to correct it, so keep re-reading it while this chat is on screen.
+    this.startPeerPresencePolling(peer);
     return peer;
   }
 
   /** A chat closed → stop tracking its peer (the last-known snapshot may stay in the store). */
   deactivatePresence(conversationId: string): void {
     this.activePresencePeers.delete(conversationId);
+    // §M7: the poll belongs to the open chat — it must not outlive it.
+    if (this.activePresencePeers.size === 0) this.clearPeerPresenceTimer();
   }
 
   /** Inbound live presence frame (`presence`/`presence.changed`) → the store. */

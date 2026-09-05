@@ -19,8 +19,14 @@
  * carries the member ids, so a DM's peer is free, and its photo is fetched once instead of by
  * every list row on every recycle. Rendering the list then touches no network at all.
  *
+ * Restored inbound messages are also ACKNOWLEDGED here (delivered receipts). The sync engine's
+ * catch-up only asks for messages past the local cursor, so once this function has advanced that
+ * cursor the engine sees nothing left to acknowledge — meaning everything received while the user
+ * was signed out would leave the SENDER stuck on a single grey tick permanently.
+ *
  * Best-effort + idempotent: any per-conversation failure is skipped; never throws.
  */
+import { syncEngine } from '../../../domain/sync';
 import {
   fetchInbox,
   upsertConversation,
@@ -105,7 +111,20 @@ export async function backfillInbox(): Promise<void> {
     const msgs = await fetchMessagesAfter(c.conversationId, cursor).catch(
       () => [],
     );
-    if (msgs.length > 0) await applyServerMessages(msgs);
+    if (msgs.length > 0) {
+      await applyServerMessages(msgs);
+      // These messages are now ON THIS DEVICE, so the sender is owed a second tick. The engine's
+      // own catch-up cannot do it: it asks only for messages past the local cursor, which this
+      // call has just advanced, so it would see an empty page and acknowledge nothing. Without
+      // this, everything received while signed out left the sender on one grey tick forever.
+      const inboundMax = msgs.reduce(
+        (max, m) => (m.senderId !== me && m.seq > max ? m.seq : max),
+        0,
+      );
+      if (inboundMax > 0) {
+        syncEngine.noteInboundDelivered(c.conversationId, inboundMax);
+      }
+    }
 
     // A DM carries no name of its own — it is named, and pictured, by the other person.
     if (!peerId) return;

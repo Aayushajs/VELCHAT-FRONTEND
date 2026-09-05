@@ -11,14 +11,17 @@
  * an unconditional bump doubled the render cost of the whole visible window per scroll tick.
  *
  * Why not cache the URL forever: media URLs are short-lived signed links (~10 min), so we store
- * url + mediaId + timestamp; fresh → serve from cache (zero API), stale → one (cached) profile
- * read + one URL resolve. "No avatar" is cached too, so we don't re-ask. Best-effort; on any
- * failure the caller falls back to a coloured initial.
+ * url + mediaId + timestamp; fresh → serve from cache (zero API), stale → render the last known
+ * URL IMMEDIATELY and refresh behind it (one cached profile read + one URL resolve). "No avatar"
+ * is cached too, so we don't re-ask. A stale URL is served rather than withheld because its
+ * bytes are already in the native image cache, so it still renders with the API unreachable;
+ * only a contact we have never resolved falls back to a coloured initial.
  *
  * Both caches are BOUNDED and purgeable (§M0 rule 7): a per-account signed URL is another
  * account's data, so `clearContactAvatarCache()` must run on logout.
  */
 import { useEffect, useRef, useState } from 'react';
+import { Image } from 'react-native';
 import { kv } from '../../../infra';
 import { getProfile, getMediaUrl } from '../api/userApi';
 
@@ -92,8 +95,16 @@ function write(id: string, c: Cached): void {
   } catch {
     // best-effort cache
   }
-  if (c.url) memSet(id, c.url);
-  else mem.delete(id); // "no avatar" → never leave a stale URL in the render cache
+  if (c.url) {
+    memSet(id, c.url);
+    // Pull the BYTES into the native image cache while the backend is reachable. The URL is a
+    // ~10-minute signed link that cannot be re-signed once the API is unreachable, but the
+    // decoder can still serve this exact URL from its own disk cache — which is what keeps
+    // photos on screen when the backend is down.
+    Image.prefetch(c.url).catch(() => undefined);
+  } else {
+    mem.delete(id); // "no avatar" → never leave a stale URL in the render cache
+  }
 }
 
 /**
@@ -132,11 +143,20 @@ export function useContactAvatar(
     const cached = read(accountId);
     const fresh = cached && Date.now() - cached.at < URL_TTL_MS;
 
-    if (fresh) {
-      // Seed the render cache from MMKV (or clear it for a known "no avatar"); no network.
+    // Seed the render cache from whatever we already know FIRST, fresh or not.
+    //
+    // This used to happen only on the `fresh` branch, so a STALE entry rendered nothing while
+    // the refresh was in flight — and if that refresh failed (backend down, offline, expired
+    // signature) it rendered nothing at all and the row fell back to a coloured initial. The
+    // last known URL is still the best answer available: its bytes are in the native image
+    // cache (primed in `write`), so it keeps displaying even with the API unreachable.
+    if (cached) {
       if (cached.url) memSet(accountId, cached.url);
       else mem.delete(accountId);
       settle();
+    }
+
+    if (fresh) {
       return () => {
         alive = false;
       };

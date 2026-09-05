@@ -5,9 +5,12 @@
  * persists the directory profile. Both read the account id from infra (no cross-feature
  * import); it's already set by the time the app reaches home.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Image } from 'react-native';
 import type { Image as CroppedImage } from 'react-native-image-crop-picker';
+import { useConnectivity } from '../../../core';
 import {
+  backoffMs,
   getAccountId,
   isAppError,
   kv,
@@ -32,6 +35,13 @@ export { hapticTick } from '../../../infra';
 // (e.g. a slow cold-start fetch in flight) must not resurrect the just-deleted photo,
 // so reload snapshots this at the start and bails out of re-caching if it changed.
 let avatarRemovalEpoch = 0;
+
+/**
+ * How many times the profile read is retried before giving up for this mount. Six full-jitter
+ * attempts span well past a free-tier cold start without becoming a poll against a backend that
+ * is genuinely down (coming back online triggers a fresh attempt regardless).
+ */
+const MAX_PROFILE_RETRIES = 6;
 
 type CropPicker = typeof import('react-native-image-crop-picker').default;
 
@@ -141,6 +151,11 @@ export function useProfileDetails(): {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [remoteAvatarUrl, setRemoteAvatarUrl] = useState<string | null>(null);
+  /** Consecutive failures — drives the retry backoff below. Reset on success. */
+  const attempts = useRef(0);
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const disposed = useRef(false);
+  const online = useConnectivity(c => c.online);
 
   const reload = useCallback(async (): Promise<void> => {
     const accountId = getAccountId();
@@ -167,6 +182,11 @@ export function useProfileDetails(): {
           // Cache it (reactive) → the header/Settings/Profile show the photo instantly,
           // here and on the next launch, without waiting for this round-trip again.
           kv.set(KVKeys.avatarUrl, url);
+          // Pull the BYTES into the native image cache now, while the backend is reachable.
+          // The URL is a ~10-minute signed link, so when the API later goes down (or the link
+          // expires) there is no way to re-sign it — but the decoder can still serve this exact
+          // URL from its own disk cache, which is what keeps the photo on screen offline.
+          Image.prefetch(url).catch(() => undefined);
         } catch {
           // A missing signed URL just means we keep whatever local copy we have.
         }
@@ -175,18 +195,54 @@ export function useProfileDetails(): {
         setRemoteAvatarUrl(null);
         kv.delete(KVKeys.avatarUrl);
       }
+      attempts.current = 0; // a clean read — stop retrying
     } catch (e) {
       setError(
         isAppError(e) ? e.message : 'Could not refresh your profile just now.',
       );
+      /**
+       * RETRY. This fetch is what resolves the avatar's signed URL, and it used to run exactly
+       * once per mount: one failure meant no photo for the whole session, and the photo only
+       * "appeared after restarting the app" because the next launch happened to succeed. The
+       * backend is a hibernating free-tier instance (hence `warmBackend()` at startup), so the
+       * first request after sign-in very often loses that 30-50 s cold-start race.
+       *
+       * Full-jitter backoff, capped attempts — enough to ride out a cold start without turning a
+       * genuinely-down backend into a polling loop. The local mirror keeps rendering throughout,
+       * so this is never on the render path.
+       */
+      attempts.current += 1;
+      if (attempts.current <= MAX_PROFILE_RETRIES && !disposed.current) {
+        const delay = backoffMs(attempts.current);
+        if (retryTimer.current !== null) clearTimeout(retryTimer.current);
+        retryTimer.current = setTimeout(() => {
+          retryTimer.current = null;
+          if (!disposed.current) void reload();
+        }, delay);
+      }
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
+    disposed.current = false;
     void reload();
+    return () => {
+      // §M7: the retry timer is owned by this hook and must not outlive it.
+      disposed.current = true;
+      if (retryTimer.current !== null) {
+        clearTimeout(retryTimer.current);
+        retryTimer.current = null;
+      }
+    };
   }, [reload]);
+
+  // Coming back online is the strongest possible signal that a failed fetch is now worth
+  // repeating — far better than waiting out the remaining backoff.
+  useEffect(() => {
+    if (online && attempts.current > 0) void reload();
+  }, [online, reload]);
 
   return { loading, error, remoteAvatarUrl, reload };
 }

@@ -60,15 +60,18 @@ export {
   sanitizeLikeQuery,
 } from './search';
 export type { ConversationSearchHit, MessageSearchHit } from './search';
+export { dmConversationId } from './dmId';
 export {
   pendingReceiptFrames,
   mergeWatermark,
+  parseReceiptFrame,
   EMPTY_WATERMARKS,
 } from './receiptLedger';
 export type {
   ReceiptWatermarks,
   ReceiptState,
   ReceiptFrame,
+  InboundReceipt,
 } from './receiptLedger';
 export {
   getDesired,

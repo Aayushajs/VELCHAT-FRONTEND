@@ -17,7 +17,7 @@ import {
 } from '../../../infra';
 import { clearProfileCache, clearContactAvatarCache } from '../../user';
 import { clearContactsDiscoveryCache } from '../../contacts';
-import { clearConversationPeerCache } from '../../chat';
+import { clearConversationPeerCache, clearStartDmCache } from '../../chat';
 import { logout } from '../api/authApi';
 import type { Tokens } from '../api/authApi';
 
@@ -111,6 +111,9 @@ export const useAuthStore = create<AuthStore>(set => ({
     // full of the PREVIOUS account contact graph - it must not survive into the next sign-in.
     clearContactsDiscoveryCache();
     clearConversationPeerCache();
+    // "this DM already exists server-side" knowledge is per-account too — the next sign-in
+    // must re-create/re-seed its own DMs rather than assume this account's were enough.
+    clearStartDmCache();
     set({ state: 'signed_out', accountId: null, sessionId: null, phone: null });
   },
 
