@@ -86,7 +86,7 @@ export function ChatScreen(): React.JSX.Element {
     useNavigation<NativeStackNavigationProp<RootStackParamList>>();
   const route = useRoute<RouteProp<RootStackParamList, 'Chat'>>();
   const { conversationId, name } = route.params;
-  const { messages, meId } = useMessages(conversationId);
+  const { messages, meId, loadOlder } = useMessages(conversationId);
   const send = useSendMessage(conversationId);
   const retry = useRetrySend();
   const { notifyTyping, stopTyping } = useTyping(conversationId);
@@ -210,6 +210,10 @@ export function ChatScreen(): React.JSX.Element {
             getItemType={messageItemType}
             onScroll={onScroll}
             scrollEventThrottle={16}
+            // Inverted list: the "end" is the TOP, i.e. the oldest bubble on screen. Without this
+            // the history simply stopped at one window and nothing could ever load more.
+            onEndReached={loadOlder}
+            onEndReachedThreshold={0.5}
             contentContainerStyle={LIST_CONTENT_STYLE}
             showsVerticalScrollIndicator={false}
           />

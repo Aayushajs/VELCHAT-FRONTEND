@@ -19,6 +19,8 @@ import {
 
 const DESIRED_PREFIX = 'rcpt.want.';
 const SENT_PREFIX = 'rcpt.sent.';
+/** What the PEER has told us they know — the inbound direction (their ticks on our messages). */
+const PEER_PREFIX = 'rcpt.peer.';
 
 function read(prefix: string, conversationId: string): ReceiptWatermarks {
   const raw = kv.getString(prefix + conversationId);
@@ -77,6 +79,31 @@ export function noteSent(
 }
 
 /**
+ * The peer's cumulative watermark for a conversation.
+ *
+ * Receipts routinely arrive for messages we do not hold yet: on reconnect the `receipt` frame for
+ * `up_to_seq: 50` can land before the backfill delivers 46-50. Applied against rows that do not
+ * exist, it matched nothing and was gone — and when those rows then arrived as `sent`, nothing
+ * remained to lift them, leaving permanent grey ticks on messages the peer had already read.
+ * Persisting it lets the backfill re-apply the watermark once the rows exist.
+ */
+export function getPeerWatermark(conversationId: string): ReceiptWatermarks {
+  return read(PEER_PREFIX, conversationId);
+}
+
+/** Record what the peer told us, monotonically. Returns true when it actually advanced. */
+export function notePeerWatermark(
+  conversationId: string,
+  patch: { delivered?: number | undefined; read?: number | undefined },
+): boolean {
+  const before = getPeerWatermark(conversationId);
+  const after = mergeWatermark(before, patch);
+  if (after === before) return false;
+  write(PEER_PREFIX, conversationId, after);
+  return true;
+}
+
+/**
  * Conversations with receipts still owed. Kept as an explicit index rather than scanning MMKV:
  * a flush runs on every reconnect and after every inbound burst, and scanning every key on a
  * device with thousands of conversations would put that cost on the message hot path.
@@ -102,7 +129,11 @@ export function hasDirty(): boolean {
 export function clearAllReceipts(): void {
   dirty.clear();
   for (const key of kv.getAllKeys()) {
-    if (key.startsWith(DESIRED_PREFIX) || key.startsWith(SENT_PREFIX)) {
+    if (
+      key.startsWith(DESIRED_PREFIX) ||
+      key.startsWith(SENT_PREFIX) ||
+      key.startsWith(PEER_PREFIX)
+    ) {
       kv.delete(key);
     }
   }

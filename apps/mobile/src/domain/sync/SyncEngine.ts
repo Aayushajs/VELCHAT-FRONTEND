@@ -43,6 +43,7 @@ import {
   markMessageFailed,
   markMessageSending,
   maxSeqForConversation,
+  minSeqForConversation,
   applyReceipt,
   enqueueOptimisticSend,
   claimNextDue,
@@ -52,14 +53,18 @@ import {
   requeueFailed,
   outboxStats,
   classifySendFailure,
+  shouldProbeGap,
   backoffMs,
   listConversationIds,
   clearUnread,
+  upsertConversation,
   pendingReceiptFrames,
   getDesired,
   getSent,
   noteDesired,
   noteSent,
+  getPeerWatermark,
+  notePeerWatermark,
   markDirty,
   takeDirty,
 } from '../../infra';
@@ -88,6 +93,13 @@ const RESYNC_CONCURRENCY = 4;
 const BACKFILL_PAGE = 100;
 /** Safety stop for the paging loop: 100 pages = 10k messages in one conversation, per resync. */
 const MAX_BACKFILL_PAGES = 100;
+/**
+ * Grace period before a backgrounded app tears its socket down (§M13). Not zero: switching apps
+ * for a few seconds is constant, and suspend-on-blur would turn every glance at the notification
+ * shade into a reconnect + full catch-up. Long enough to ride out a quick switch, short enough
+ * that a phone in a pocket is never holding a socket open.
+ */
+const BACKGROUND_SUSPEND_DELAY_MS = 30_000;
 
 class SyncEngine {
   private socket: RealtimeSocket | null = null;
@@ -96,6 +108,9 @@ class SyncEngine {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private outboxTimer: ReturnType<typeof setTimeout> | null = null;
   private receiptTimer: ReturnType<typeof setTimeout> | null = null;
+  private suspendTimer: ReturnType<typeof setTimeout> | null = null;
+  /** True while the app is backgrounded and the socket has been deliberately released. */
+  private suspended = false;
   /**
    * The conversation the user is currently looking at. Messages that land here are read the
    * instant they arrive — that is what makes the peer's ticks turn blue live, and what stops the
@@ -111,6 +126,21 @@ class SyncEngine {
   private draining = false;
   /** Set when the server rate-limits a send; no drain runs before it expires. */
   private outboxCooldownUntil = 0;
+  /**
+   * Per conversation, the cursor a gap-probe last ran from. Deleted messages leave a permanent,
+   * legitimate hole in `seq`, so a probe that comes back empty must not be repeated on every
+   * later message — only a cursor that actually moved earns another.
+   */
+  private readonly gapProbedFrom = new Map<string, number>();
+  /**
+   * Resolves an account id to a display name. INJECTED by the feature layer (§M3: domain must
+   * not import features), because a brand-new DM arrives as a bare account id and would
+   * otherwise sit in the chat list showing a raw UUID until the next cold start.
+   */
+  private displayNameResolver:
+    ((accountId: string) => Promise<string | undefined>) | null = null;
+  /** Account ids we already tried to name — one attempt each, never a retry loop per message. */
+  private readonly namedPeers = new Set<string>();
   // Ephemeral realtime (§C4/§A15) — NEVER persisted. One owned expiry timer per typing
   // conversation; `activePresencePeers` maps an open DM → the peer we're watching.
   private readonly typingTimers = new Map<
@@ -121,6 +151,33 @@ class SyncEngine {
   // One-shot crash-recovery: resets outbox rows orphaned in `sending` by a prior kill.
   // The first drain awaits it so it can't claim behind a stuck row.
   private recovery: Promise<unknown> | null = null;
+
+  /** Provide the profile lookup used to name a newly-arrived DM (called once, at startup). */
+  setDisplayNameResolver(
+    fn: (accountId: string) => Promise<string | undefined>,
+  ): void {
+    this.displayNameResolver = fn;
+  }
+
+  /**
+   * A DM created from an inbound message is named by the sender's ACCOUNT ID, because that is all
+   * the message carries. Resolve it to a real name so the chat list doesn't show a raw UUID until
+   * the app is restarted.
+   */
+  private async nameStubConversation(
+    conversationId: string,
+    senderId: string,
+  ): Promise<void> {
+    const resolve = this.displayNameResolver;
+    if (!resolve || this.namedPeers.has(senderId)) return;
+    this.namedPeers.add(senderId);
+    try {
+      const name = (await resolve(senderId))?.trim();
+      if (name) await upsertConversation(conversationId, { name });
+    } catch {
+      // Best-effort: the id remains as the label until the next launch resolves it.
+    }
+  }
 
   /** Push the connection state to the observable store (§5 addendum). */
   private setConnState(s: ConnectionState): void {
@@ -141,7 +198,13 @@ class SyncEngine {
     // §8 addendum: detect background→foreground transitions. If the socket died silently
     // while backgrounded (common on iOS), NetInfo doesn't fire — this catches it.
     this.appStateUnsub = subscribeAppState(s => {
-      if (s === 'active') this.onForeground();
+      if (s === 'active') {
+        this.clearSuspendTimer();
+        this.suspended = false;
+        this.onForeground();
+      } else {
+        this.scheduleSuspend();
+      }
     });
     // Seed the initial connectivity (the subscription only fires on CHANGES).
     void getNetworkStatus()
@@ -163,8 +226,12 @@ class SyncEngine {
     this.clearReconnectTimer();
     this.clearOutboxTimer();
     this.clearReceiptTimer();
+    this.clearSuspendTimer();
+    this.suspended = false;
     this.clearAllTyping();
     this.activeConversationId = null;
+    this.gapProbedFrom.clear();
+    this.namedPeers.clear();
     this.activePresencePeers.clear();
     useRealtimeStore.getState().reset();
     const s = this.socket;
@@ -211,6 +278,7 @@ class SyncEngine {
   // ── socket lifecycle ─────────────────────────────────────────────────────
   private connect(): void {
     if (this.stopped) return;
+    if (this.suspended) return; // backgrounded: §M13 holds no socket
     if (this.socket) return; // single-flight: one socket per engine
     if (!this.online || !hasSession()) return;
     const token = getAccessToken();
@@ -331,6 +399,39 @@ class SyncEngine {
     }, delay);
   }
 
+  /**
+   * §M13: an app in the background holds NO WebSocket. The socket's 25s ping and watchdog, plus
+   * the outbox timer, otherwise keep waking the device all night for a user who is asleep —
+   * hundreds of wakeups, a socket the OS may kill silently anyway, and a battery budget blown.
+   * Delivery while backgrounded is push's job; the cursor catch-up on resume is the backstop.
+   */
+  private scheduleSuspend(): void {
+    if (this.stopped || this.suspended || this.suspendTimer !== null) return;
+    this.suspendTimer = setTimeout(() => {
+      this.suspendTimer = null;
+      if (this.stopped) return;
+      this.suspended = true;
+      // Flush what the peer is owed BEFORE releasing the socket — otherwise a read the user just
+      // performed sits in the ledger until the next foreground.
+      this.flushReceipts();
+      this.clearReconnectTimer();
+      this.clearOutboxTimer();
+      this.clearReceiptTimer();
+      this.clearAllTyping();
+      const s = this.socket;
+      this.socket = null;
+      s?.close();
+      this.setConnState('disconnected');
+    }, BACKGROUND_SUSPEND_DELAY_MS);
+  }
+
+  private clearSuspendTimer(): void {
+    if (this.suspendTimer !== null) {
+      clearTimeout(this.suspendTimer);
+      this.suspendTimer = null;
+    }
+  }
+
   private clearReceiptTimer(): void {
     if (this.receiptTimer !== null) {
       clearTimeout(this.receiptTimer);
@@ -415,6 +516,10 @@ class SyncEngine {
       );
       if (batch.length === 0) return;
       await applyServerMessages(batch);
+      // Rows that just landed may already have been delivered/read by the peer — their receipt
+      // arrived while we had nothing to apply it to. Re-apply the remembered watermark so those
+      // bubbles come back with the right ticks instead of stuck grey ones.
+      await this.applyPeerWatermark(conversationId);
       const highest = batch.reduce(
         (max, m) => (m.seq > max ? m.seq : max),
         cursor,
@@ -438,6 +543,22 @@ class SyncEngine {
   }
 
   // ── receipts (§F2/§C5) ───────────────────────────────────────────────────
+  /** Re-apply what the peer already told us, for rows that only exist now. */
+  private async applyPeerWatermark(conversationId: string): Promise<void> {
+    const peer = getPeerWatermark(conversationId);
+    try {
+      if (peer.delivered > 0) {
+        await applyReceipt(conversationId, peer.delivered, 'delivered');
+      }
+      if (peer.read > 0) await applyReceipt(conversationId, peer.read, 'read');
+    } catch (e) {
+      log.warn('re-apply peer receipts failed', {
+        conversationId,
+        reason: String(e),
+      });
+    }
+  }
+
   /**
    * Record that a message is on this device. Called from BOTH receive paths — the live frame and
    * the REST catch-up — because a message that arrived while offline is just as delivered as one
@@ -460,7 +581,7 @@ class SyncEngine {
   }
 
   private scheduleReceiptFlush(): void {
-    if (this.stopped || this.receiptTimer !== null) return;
+    if (this.stopped || this.suspended || this.receiptTimer !== null) return;
     this.receiptTimer = setTimeout(() => {
       this.receiptTimer = null;
       void this.flushReceipts();
@@ -514,6 +635,14 @@ class SyncEngine {
     // A new message from the peer means they've stopped typing — clear the indicator (§C4).
     this.clearTyping(m.conversationId);
     try {
+      // Read the cursor BEFORE applying: once this message lands, the hole it skipped over
+      // becomes invisible, and no future `afterSeq` request can ever reach back past it.
+      let localMax = 0;
+      try {
+        localMax = await maxSeqForConversation(m.conversationId);
+      } catch {
+        localMax = 0;
+      }
       await applyServerMessage(m);
       // Live fan-out frames are metadata-only (no body) unless the message was server-readable,
       // so an inbound frame often has no `content` → the bubble would render blank. Pull the
@@ -529,7 +658,27 @@ class SyncEngine {
           // best-effort: the metadata row still exists; content syncs on next catch-up
         }
       }
+      // The push skipped ahead of what we hold — the messages in between were dropped by
+      // best-effort fan-out, and REST is the only way they can still be recovered.
+      if (
+        shouldProbeGap({
+          localMax,
+          incomingSeq: m.seq,
+          lastProbedFrom: this.gapProbedFrom.get(m.conversationId),
+        })
+      ) {
+        this.gapProbedFrom.set(m.conversationId, localMax);
+        try {
+          await this.backfillConversation(m.conversationId);
+        } catch (e) {
+          log.warn('gap backfill failed', {
+            conversationId: m.conversationId,
+            reason: String(e),
+          });
+        }
+      }
       if (m.senderId !== getAccountId()) {
+        void this.nameStubConversation(m.conversationId, m.senderId);
         this.noteDelivered(m.conversationId, m.seq);
         // Landed in the chat the user is currently reading → it is read, now. Clearing the badge
         // here is what stops it from climbing on the open conversation, and the read watermark is
@@ -572,6 +721,10 @@ class SyncEngine {
     ) {
       return;
     }
+    // Remember it even if it matches nothing right now: a receipt for messages we have not
+    // backfilled yet used to evaporate, leaving permanent grey ticks on messages the peer had
+    // already read. The backfill re-applies this watermark once those rows exist.
+    notePeerWatermark(conversationId, { [state]: upToSeq });
     try {
       await applyReceipt(conversationId, upToSeq, state);
     } catch (e) {
@@ -581,7 +734,7 @@ class SyncEngine {
 
   // ── outbox worker ────────────────────────────────────────────────────────
   private kickOutbox(): void {
-    if (this.stopped) return;
+    if (this.stopped || this.suspended) return;
     void this.drainOutbox();
   }
 
@@ -625,7 +778,7 @@ class SyncEngine {
   /** Self-adjusting timer: schedule the next drain at the earliest due time, else stay idle. */
   private async scheduleOutbox(): Promise<void> {
     this.clearOutboxTimer();
-    if (this.stopped || !this.online) return;
+    if (this.stopped || !this.online || this.suspended) return;
     let stats: { queued: number; nextDueAt: number | null };
     try {
       stats = await outboxStats();
@@ -673,6 +826,27 @@ class SyncEngine {
     );
     if (!clientMsgId) return;
     this.kickOutbox();
+  }
+
+  /**
+   * Pull the page of history immediately BEFORE what we hold (§L7 "load older").
+   *
+   * The API is forward-only — there is no `before` parameter — but `afterSeq` is a free cursor,
+   * so asking from `oldestHeld - 1 - page` and taking a page reaches back correctly. Returns
+   * whether anything new landed, so the UI only grows its window when there is more to show.
+   */
+  async loadOlderMessages(
+    conversationId: string,
+    page: number,
+  ): Promise<boolean> {
+    const oldest = await minSeqForConversation(conversationId);
+    if (oldest <= 1) return false; // seq 1 is the first message ever — nothing precedes it
+    const from = Math.max(0, oldest - 1 - page);
+    const older = await fetchMessagesAfter(conversationId, from, page);
+    const fresh = older.filter(m => m.seq < oldest);
+    if (fresh.length === 0) return false;
+    await applyServerMessages(fresh);
+    return true;
   }
 
   /**

@@ -23,6 +23,9 @@ export {
   markMessageFailed,
   markMessageSending,
   maxSeqForConversation,
+  minSeqForConversation,
+  countMessages,
+  MESSAGE_PAGE,
   applyReceipt,
 } from './messages';
 export {
@@ -37,6 +40,8 @@ export {
 } from './outbox';
 export type { OutboxItem, OutboxStats } from './outbox';
 export { classifySendFailure } from './sendFailurePolicy';
+export { shouldProbeGap } from './gapDetection';
+export type { GapProbeInput } from './gapDetection';
 export type { SendFailureDecision } from './sendFailurePolicy';
 export {
   reconcileDecision,
@@ -67,6 +72,8 @@ export {
   getSent,
   noteDesired,
   noteSent,
+  getPeerWatermark,
+  notePeerWatermark,
   markDirty,
   takeDirty,
   hasDirty,

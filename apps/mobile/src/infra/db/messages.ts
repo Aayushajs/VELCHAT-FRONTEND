@@ -22,16 +22,49 @@ const MESSAGE_WINDOW = 50;
  * reactions/attachments are intentionally NOT observed (the bubble doesn't render them yet)
  * so a receipt burst can't trigger an O(n) re-query for columns nothing draws.
  */
-export function observeMessages(conversationId: string) {
+export function observeMessages(
+  conversationId: string,
+  limit: number = MESSAGE_WINDOW,
+) {
   return getDatabase()
     .get<Message>('messages')
     .query(
       Q.where('conversation_id', conversationId),
       Q.where('deleted', false),
       Q.sortBy('created_at', Q.desc),
-      Q.take(MESSAGE_WINDOW),
+      Q.take(Math.max(1, limit)),
     )
     .observeWithColumns(['state']);
+}
+
+/** How many more messages a "load older" step reveals. */
+export const MESSAGE_PAGE = MESSAGE_WINDOW;
+
+/** Total messages held locally for a conversation — tells the UI whether older ones exist. */
+export function countMessages(conversationId: string): Promise<number> {
+  return getDatabase()
+    .get<Message>('messages')
+    .query(
+      Q.where('conversation_id', conversationId),
+      Q.where('deleted', false),
+    )
+    .fetchCount();
+}
+
+/** Lowest seq we hold — the cursor a fetch of OLDER history has to reach back before. */
+export async function minSeqForConversation(
+  conversationId: string,
+): Promise<number> {
+  const rows = await getDatabase()
+    .get<Message>('messages')
+    .query(
+      Q.where('conversation_id', conversationId),
+      Q.where('seq', Q.gt(0)),
+      Q.sortBy('seq', Q.asc),
+      Q.take(1),
+    )
+    .fetch();
+  return rows[0]?.seq ?? 0;
 }
 
 /** A short client message id (server seq is assigned later, on ACK). */
@@ -313,7 +346,16 @@ export async function markMessageSent(
     ops.push(
       row.prepareUpdate(m => {
         m.seq = ack.seq;
-        if (ack.serverTs !== undefined) m.serverTs = ack.serverTs;
+        if (ack.serverTs !== undefined) {
+          m.serverTs = ack.serverTs;
+          // Re-stamp the ordering key to the SERVER clock. The list is ordered by `created_at`,
+          // which was stamped when the user hit send — fine online, hours stale for a message
+          // composed offline. Left alone it stays pinned at its compose time, buried under
+          // everything that arrived while there was no signal (and, past a window's worth,
+          // outside the loaded window entirely), which reads as "my message disappeared".
+          // Never move it backwards: a skewed server clock must not re-bury it.
+          if (ack.serverTs > m.createdAt) m.createdAt = ack.serverTs;
+        }
         if (m.state === 'sending' || m.state === 'failed') m.state = 'sent';
       }),
     );
