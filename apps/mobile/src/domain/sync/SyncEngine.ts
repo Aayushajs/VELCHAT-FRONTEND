@@ -17,6 +17,8 @@ import {
   useRealtimeStore,
   normalizePresenceStatus,
   TYPING_TTL_MS,
+  recordLatency,
+  logLatencySnapshot,
 } from '../../core';
 import type { ConnectionState } from '../../core';
 import {
@@ -135,6 +137,12 @@ class SyncEngine {
   /** Set when the server rate-limits a send; no drain runs before it expires. */
   private outboxCooldownUntil = 0;
   /**
+   * When realtime last went down. The gap until the next successful open is how long the user was
+   * actually cut off — the number that decides whether a flaky link is survivable, and one no unit
+   * test can observe.
+   */
+  private lastCloseAt: number | null = null;
+  /**
    * Per conversation, the cursor a gap-probe last ran from. Deleted messages leave a permanent,
    * legitimate hole in `seq`, so a probe that comes back empty must not be repeated on every
    * later message — only a cursor that actually moved earns another.
@@ -226,6 +234,10 @@ class SyncEngine {
         this.suspended = false;
         this.onForeground();
       } else {
+        // Backgrounding is the natural reporting boundary: a session's numbers, emitted once,
+        // where they cost nothing. This must NOT live inside the suspend timer — that is gated
+        // on push being available, so the snapshot would never fire while push is missing.
+        logLatencySnapshot();
         this.scheduleSuspend();
       }
     });
@@ -310,6 +322,10 @@ class SyncEngine {
     this.setConnState('connecting');
     const socket = new RealtimeSocket({
       onOpen: () => {
+        if (this.lastCloseAt !== null) {
+          recordLatency('ws.reconnect', Date.now() - this.lastCloseAt);
+          this.lastCloseAt = null;
+        }
         this.reconnectAttempts = 0;
         // The token is proven good — re-arm the 4001 refresh budget for the next expiry.
         this.authRefreshAttempts = 0;
@@ -347,6 +363,9 @@ class SyncEngine {
   }
 
   private onSocketClose(code: number, reason: string): void {
+    // Only the FIRST close of an outage starts the clock; retries that fail to open must not
+    // reset it, or a long outage would be reported as a series of short ones.
+    if (this.lastCloseAt === null) this.lastCloseAt = Date.now();
     this.socket = null;
     // Peers' "typing" is no longer trustworthy once the link drops — clear all indicators.
     this.clearAllTyping();
@@ -656,6 +675,7 @@ class SyncEngine {
 
   // ── inbound frames ───────────────────────────────────────────────────────
   private async onInboundMessage(data: unknown): Promise<void> {
+    const arrivedAt = Date.now();
     const m = normalizeServerMessage(data);
     if (!m) return;
     // A new message from the peer means they've stopped typing — clear the indicator (§C4).
@@ -703,6 +723,9 @@ class SyncEngine {
           });
         }
       }
+      // Frame → row on screen. This is the "did it arrive?" feeling, and the only place the
+      // receive path can be judged without a device in hand.
+      recordLatency('recv.apply', Date.now() - arrivedAt);
       if (m.senderId !== getAccountId()) {
         void this.nameStubConversation(m.conversationId, m.senderId);
         this.noteDelivered(m.conversationId, m.seq);
@@ -781,6 +804,10 @@ class SyncEngine {
           const ack = await sendChatMessage(item.input);
           await markMessageSent(item.clientMsgId, ack);
           await markAckd(item.id);
+          // From when the user composed it, not from when this attempt started: a message that
+          // sat in the queue through three failures took that long to be delivered, and pretending
+          // otherwise would make a bad network look fast.
+          recordLatency('send.ack', Date.now() - item.createdAt);
         } catch (e) {
           const attempts = item.attempts + 1;
           const msg = isAppError(e) ? e.message : String(e);
@@ -845,12 +872,16 @@ class SyncEngine {
   ): Promise<void> {
     // ONE transaction for the bubble + its outbox row: a crash between two writes used to strand
     // a message in `sending` that nothing would ever transmit or surface as failed.
+    const t0 = Date.now();
     const clientMsgId = await enqueueOptimisticSend(
       conversationId,
       text,
       senderId,
     );
     if (!clientMsgId) return;
+    // The budget that decides whether sending FEELS instant (§L7: ≤20 ms p50). Measured here
+    // because this is the moment the bubble becomes visible — everything after is background.
+    recordLatency('send.local', Date.now() - t0);
     this.kickOutbox();
   }
 
