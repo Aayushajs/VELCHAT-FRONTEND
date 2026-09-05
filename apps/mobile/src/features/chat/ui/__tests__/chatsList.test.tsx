@@ -64,6 +64,7 @@ function rowProps(
     time: vm.time,
     unreadCount: vm.unread,
     isDm: vm.type === 'dm',
+    peerAvatarUrl: vm.peerAvatarUrl,
     onOpen: () => undefined,
   };
 }

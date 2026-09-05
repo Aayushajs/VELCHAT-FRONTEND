@@ -17,7 +17,7 @@ import {
   UserIcon,
   type IconProps,
 } from '../../../../design-system';
-import { useContactAvatar } from '../../../user';
+import { useConversationIdentity } from '../../hooks/useConversationIdentity';
 import {
   useChatHeaderPresence,
   type PresenceEntry,
@@ -95,8 +95,13 @@ export function ChatHeader({
   const { t: tr } = useTranslation();
   const title = name ?? tr('tabs.chats');
   const initial = (name ?? '').trim().charAt(0).toUpperCase();
-  const { typing, presence, peerId } = useChatHeaderPresence(conversationId);
-  const dp = useContactAvatar(peerId ?? undefined);
+  const { typing, presence } = useChatHeaderPresence(conversationId);
+  // The photo comes from the conversation row the inbox sync already resolved, so the header is
+  // complete on the first frame instead of three round-trips after the tap. Stale entries are
+  // revalidated in the background by the hook, and the row is observed, so a changed picture
+  // appears without the user doing anything.
+  const { peerAvatarUrl } = useConversationIdentity(conversationId);
+  const dp = peerAvatarUrl;
   const presenceLine = derivePresenceLine(typing, presence, tr);
   return (
     <View

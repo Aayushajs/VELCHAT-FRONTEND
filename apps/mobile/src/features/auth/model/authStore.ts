@@ -16,6 +16,7 @@ import {
   KVKeys,
 } from '../../../infra';
 import { clearProfileCache, clearContactAvatarCache } from '../../user';
+import { clearContactsDiscoveryCache } from '../../contacts';
 import { clearConversationPeerCache } from '../../chat';
 import { logout } from '../api/authApi';
 import type { Tokens } from '../api/authApi';
@@ -106,6 +107,9 @@ export const useAuthStore = create<AuthStore>(set => ({
     clearAllReceipts();
     clearProfileCache();
     clearContactAvatarCache();
+    // Number -> accountId map built by OPRF discovery. Feature-owned, dynamically keyed, and
+    // full of the PREVIOUS account contact graph - it must not survive into the next sign-in.
+    clearContactsDiscoveryCache();
     clearConversationPeerCache();
     set({ state: 'signed_out', accountId: null, sessionId: null, phone: null });
   },

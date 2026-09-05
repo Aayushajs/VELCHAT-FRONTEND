@@ -31,14 +31,27 @@ export interface ContactInput {
 
 /** Stable fingerprint of one contact — changes on rename, number add/remove, or photo change. */
 export function contactFingerprint(c: ContactInput): string {
-  const key = `${c.name.trim().toLowerCase()}|${[...c.e164s].sort().join(',')}|${c.thumbnailPath ?? ''}`;
+  const key = `${c.name.trim().toLowerCase()}|${[...c.e164s]
+    .sort()
+    .join(',')}|${c.thumbnailPath ?? ''}`;
   return fnv1a(key);
+}
+
+/**
+ * Combine already-computed per-contact fingerprints into the whole-book hash.
+ *
+ * Split out from {@link bookHash} so a caller with a large address book can compute the
+ * per-contact fingerprints in yielding chunks (the expensive, linear-in-book-size half) and
+ * still fold them with the same function — the sort+join tail is a couple of milliseconds even
+ * at a few thousand contacts, so only the map needs slicing.
+ */
+export function hashFingerprints(fingerprints: readonly string[]): string {
+  return fnv1a([...fingerprints].sort().join(','));
 }
 
 /** One hash over the whole address book — equal to the last value ⇒ nothing changed, skip the diff. */
 export function bookHash(contacts: readonly ContactInput[]): string {
-  const fps = contacts.map(contactFingerprint).sort();
-  return fnv1a(fps.join(','));
+  return hashFingerprints(contacts.map(contactFingerprint));
 }
 
 export interface ContactsDiff {

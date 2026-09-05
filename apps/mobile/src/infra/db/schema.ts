@@ -10,7 +10,7 @@
 import { appSchema, tableSchema } from '@nozbe/watermelondb';
 
 export const schema = appSchema({
-  version: 1,
+  version: 2,
   tables: [
     tableSchema({
       name: 'conversations',
@@ -19,6 +19,16 @@ export const schema = appSchema({
         { name: 'tenant_id', type: 'string', isOptional: true },
         { name: 'name', type: 'string', isOptional: true },
         { name: 'avatar_media_id', type: 'string', isOptional: true },
+        // Denormalised peer identity for DMs (schema v2). The inbox response already carries the
+        // member ids, so the peer is known at sync time for free — storing it here is what lets a
+        // chat-list row render with a name and a photo from a pure LOCAL read. Resolving it per
+        // row instead cost three REST calls per row, per recycle, which on a real connection meant
+        // photos that arrived late, out of order, or never.
+        { name: 'peer_id', type: 'string', isOptional: true },
+        { name: 'peer_avatar_url', type: 'string', isOptional: true },
+        // When the photo was last resolved — drives revalidation, so a peer changing their picture
+        // is picked up instead of a cached URL being trusted forever.
+        { name: 'peer_avatar_at', type: 'number', isOptional: true },
         { name: 'is_announcement', type: 'boolean' },
         { name: 'is_pinned', type: 'boolean', isIndexed: true },
         { name: 'is_archived', type: 'boolean', isIndexed: true },

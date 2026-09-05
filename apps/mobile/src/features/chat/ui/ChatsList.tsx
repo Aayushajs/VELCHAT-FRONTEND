@@ -18,13 +18,11 @@ import {
   spacing,
 } from '../../../design-system';
 import { useTypingUser } from '../../../core';
-import { useContactAvatar } from '../../user';
 import type { RootStackParamList } from '../../../navigation/types';
 import {
   useConversations,
   type ConversationRowVM,
 } from '../hooks/useConversations';
-import { useConversationPeer } from '../hooks/useConversationPeer';
 
 const AVATAR = 54;
 
@@ -58,6 +56,8 @@ interface ConversationRowProps {
   time: string;
   unreadCount: number;
   isDm: boolean;
+  /** Already-resolved peer photo; absent → coloured initial. Never fetched during render. */
+  peerAvatarUrl: string | undefined;
   onOpen: (id: string, name?: string) => void;
 }
 
@@ -73,6 +73,7 @@ function ConversationRowBase({
   time,
   unreadCount,
   isDm,
+  peerAvatarUrl,
   onOpen,
 }: ConversationRowProps): React.JSX.Element {
   const t = useTheme();
@@ -81,9 +82,10 @@ function ConversationRowBase({
   const unread = unreadCount > 0;
   // Typing wins over the last-message preview for this conversation (§C4, ephemeral store).
   const typing = useTypingUser(id) !== null;
-  // The other user's VelChat profile photo (DMs only), cached — else a colourful initial.
-  const peer = useConversationPeer(isDm ? id : undefined);
-  const dp = useContactAvatar(peer);
+  // The photo arrives ON THE ROW, resolved once by the inbox sync. Fetching it here — a members
+  // lookup, a profile, then a media URL — meant three requests per row per recycle, so scrolling a
+  // long list queued hundreds of them and the photos landed late, out of order, or never.
+  const dp = isDm ? peerAvatarUrl : undefined;
   return (
     <Pressable
       accessibilityRole="button"
@@ -222,6 +224,7 @@ export function ChatsList(): React.JSX.Element {
         time={item.time}
         unreadCount={item.unread}
         isDm={item.type === 'dm'}
+        peerAvatarUrl={item.peerAvatarUrl}
         onOpen={onOpen}
       />
     ),

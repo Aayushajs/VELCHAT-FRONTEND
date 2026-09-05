@@ -60,6 +60,8 @@ export {
   listConversationIds,
   clearUnread,
   upsertConversation,
+  peerIdentityAgeMs,
+  observeConversation,
   purgeAllLocalChat,
   observeMessages,
   sendMessageLocal,
@@ -111,6 +113,7 @@ export type {
   ReconcileAction,
   BackoffOptions,
   ConversationPatch,
+  RowStream,
   ConversationSearchHit,
   MessageSearchHit,
 } from './db';

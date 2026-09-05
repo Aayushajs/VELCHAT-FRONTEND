@@ -29,6 +29,10 @@ export interface ConversationRowVM {
    * yesterday's buckets until the next DB emission (which memoised rows did anyway).
    */
   readonly time: string;
+  /** The DM's other member, resolved at sync time — never looked up while rendering. */
+  readonly peerId: string | undefined;
+  /** That peer's photo URL, already resolved. Absent → the row draws a coloured initial. */
+  readonly peerAvatarUrl: string | undefined;
 }
 
 export interface ConversationsState {
@@ -78,6 +82,11 @@ export function toConversationRow(
     unread: c.unreadCount,
     pinned: c.isPinned,
     time: conversationTimeLabel(c.lastMessageAt, now),
+    // Carried on the row itself, resolved once at sync time. A row that had to FETCH its peer and
+    // photo cost three REST calls per render — which is why photos used to arrive late, in a
+    // random order, or not at all, and why the list crawled on a real connection.
+    peerId: c.peerId,
+    peerAvatarUrl: c.peerAvatarUrl,
   };
 }
 

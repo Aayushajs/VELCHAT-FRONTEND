@@ -11,9 +11,11 @@ export {
   listConversationIds,
   clearUnread,
   upsertConversation,
+  peerIdentityAgeMs,
+  observeConversation,
   purgeAllLocalChat,
 } from './queries';
-export type { ConversationPatch } from './queries';
+export type { ConversationPatch, RowStream } from './queries';
 export {
   observeMessages,
   sendMessageLocal,

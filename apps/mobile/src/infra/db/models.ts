@@ -13,6 +13,9 @@ export class Conversation extends Model {
   @text('type') type!: string;
   @text('name') name?: string;
   @text('avatar_media_id') avatarMediaId?: string;
+  @text('peer_id') peerId?: string;
+  @text('peer_avatar_url') peerAvatarUrl?: string;
+  @field('peer_avatar_at') peerAvatarAt?: number;
   @field('is_announcement') isAnnouncement!: boolean;
   @field('is_pinned') isPinned!: boolean;
   @field('is_archived') isArchived!: boolean;

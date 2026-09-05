@@ -12,6 +12,7 @@ import { Database } from '@nozbe/watermelondb';
 import SQLiteAdapter from '@nozbe/watermelondb/adapters/sqlite';
 import { log } from '../../core';
 import { schema } from './schema';
+import { migrations } from './migrations';
 import { modelClasses } from './models';
 
 let db: Database | null = null;
@@ -22,6 +23,9 @@ export function getDatabase(): Database {
     const adapter = new SQLiteAdapter({
       dbName: 'velchat',
       schema,
+      // Without migrations a version bump silently RESETS the database — the user's whole local
+      // history gone on an app update. Every schema change ships its step here.
+      migrations,
       // New Architecture: JSI is available → off-thread, synchronous-fast reads.
       jsi: true,
       onSetUpError: error => {
