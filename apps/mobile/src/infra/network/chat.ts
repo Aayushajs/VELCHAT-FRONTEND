@@ -105,12 +105,31 @@ function pickTimestamp(
   return undefined;
 }
 
-/** Pull a display string out of a `content` field that may be a string or an object. */
+/**
+ * Pull a display string out of a `content` field that may be a string OR an object.
+ *
+ * `MessageSentPayload.content` is typed `string | Record<string, unknown>`, and the object form is
+ * what a structured message (and some clients' text) arrives as. Accepting only the string form
+ * meant those frames read as "no body", which sent the engine off to REST to re-fetch a message it
+ * had already received in full — an extra round-trip on the receive path for every such message,
+ * exactly where latency is most visible.
+ */
 function pickContent(d: Record<string, unknown>): string | undefined {
   const text = pickStr(d, 'text', 'content_plain', 'contentPlain');
   if (text !== undefined) return text;
   const content = d.content;
   if (typeof content === 'string' && content.length > 0) return content;
+  if (content && typeof content === 'object') {
+    // Structured body — take the first field that actually carries display text.
+    const inner = pickStr(
+      content as Record<string, unknown>,
+      'text',
+      'body',
+      'caption',
+      'content',
+    );
+    if (inner !== undefined) return inner;
+  }
   return undefined;
 }
 

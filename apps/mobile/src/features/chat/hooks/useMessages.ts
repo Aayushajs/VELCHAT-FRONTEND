@@ -15,6 +15,10 @@ export function useMessages(conversationId: string): {
   const [messages, setMessages] = useState<Message[]>([]);
   useEffect(() => {
     // Opening the chat = read it: clear the unread badge locally + tell the server (§F2).
+    // Telling the engine this chat is ON SCREEN is what keeps that true for messages that arrive
+    // WHILE it is open — otherwise the badge climbs on the conversation the user is reading and
+    // the sender's ticks never turn blue, because the read was only ever reported once, at mount.
+    syncEngine.setActiveConversation(conversationId);
     void syncEngine.markConversationRead(conversationId);
     let sub: { unsubscribe: () => void } | undefined;
     try {
@@ -22,7 +26,10 @@ export function useMessages(conversationId: string): {
     } catch {
       setMessages([]);
     }
-    return () => sub?.unsubscribe();
+    return () => {
+      sub?.unsubscribe();
+      syncEngine.setActiveConversation(null);
+    };
   }, [conversationId, meId]);
   return { messages, meId };
 }

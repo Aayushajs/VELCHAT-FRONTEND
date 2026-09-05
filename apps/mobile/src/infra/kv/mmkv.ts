@@ -73,6 +73,14 @@ export const kv = {
   delete(key: string): void {
     storage.delete(key);
   },
+  /**
+   * Every key currently held. Needed by the purges that run on logout: entries written under a
+   * DYNAMIC key (`rcpt.want.<conversationId>`, `avatar.<accountId>`, …) can't be deleted from a
+   * fixed list, and leaving them behind leaks the previous account's state into the next sign-in.
+   */
+  getAllKeys(): string[] {
+    return storage.getAllKeys();
+  },
   clearAll(): void {
     storage.clearAll();
   },

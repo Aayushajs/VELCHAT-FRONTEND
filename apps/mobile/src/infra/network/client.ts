@@ -133,11 +133,33 @@ const wait = (ms: number): Promise<void> =>
   new Promise(resolve => setTimeout(resolve, ms));
 
 // --- single-flight refresh --------------------------------------------------
-let refreshInFlight: Promise<string | null> | null = null;
+/**
+ * Why this is a three-way outcome and not `string | null`:
+ *
+ * "the server refused this refresh token" and "we never reached the server" demand opposite
+ * responses. The first means the session is genuinely over — sign out. The second means the
+ * session is fine and the network isn't; destroying it there is how a sleeping free-tier
+ * service, a VM that powers down at 19:30, or a tunnel turns into "the app logged me out".
+ */
+export type RefreshOutcome =
+  /** The server issued fresh tokens; they are already persisted. */
+  | { status: 'ok'; access: string }
+  /** The server authoritatively refused (revoked/expired/malformed) — the session is over. */
+  | { status: 'rejected' }
+  /** We could not ask (offline, timeout, 5xx, rate-limited) — KEEP the session, retry later. */
+  | { status: 'unavailable' };
 
-async function doRefresh(): Promise<string | null> {
+let refreshInFlight: Promise<RefreshOutcome> | null = null;
+
+/** HTTP statuses that mean "this refresh token will never work again". Everything else the
+ *  server can emit (5xx, 429, 408) is transient and must not cost the user their session. */
+function isAuthoritativeRejection(status: number | undefined): boolean {
+  return status === 400 || status === 401 || status === 403 || status === 422;
+}
+
+async function doRefresh(): Promise<RefreshOutcome> {
   const refresh = getRefreshToken();
-  if (!refresh) return null;
+  if (!refresh) return { status: 'rejected' };
   try {
     // bare axios (no interceptors) to avoid recursion
     const res = await axios.post(
@@ -152,25 +174,46 @@ async function doRefresh(): Promise<string | null> {
       access?: string;
       refresh?: string;
     };
-    if (!data?.access || !data?.refresh) return null;
+    // A 200 with a body we can't use is a server-side anomaly, not proof the session died —
+    // treat it as unavailable so a bad deploy can't sign every user out.
+    if (!data?.access || !data?.refresh) {
+      log.warn('token refresh returned an unusable body');
+      return { status: 'unavailable' };
+    }
     const next: SessionTokens = { access: data.access, refresh: data.refresh };
     const jkt = getCnfJkt();
     if (jkt) next.cnfJkt = jkt;
     setTokens(next);
-    return data.access;
+    return { status: 'ok', access: data.access };
   } catch (err) {
-    log.warn('token refresh failed', { reason: String(err) });
-    return null;
+    const status = (err as AxiosError | undefined)?.response?.status;
+    const rejected = isAuthoritativeRejection(status);
+    log.warn('token refresh failed', {
+      status,
+      outcome: rejected ? 'rejected' : 'unavailable',
+    });
+    return rejected ? { status: 'rejected' } : { status: 'unavailable' };
   }
 }
 
-export function refreshAccessToken(): Promise<string | null> {
+/** Single-flight refresh — concurrent 401s share one round-trip (never a refresh storm). */
+export function refreshSession(): Promise<RefreshOutcome> {
   if (!refreshInFlight) {
     refreshInFlight = doRefresh().finally(() => {
       refreshInFlight = null;
     });
   }
   return refreshInFlight;
+}
+
+/**
+ * Convenience wrapper for callers that only need the token. Returns `null` for BOTH failure
+ * modes, so anything that decides whether to END a session must use {@link refreshSession}
+ * and check for `rejected` — a `null` here may only mean the network is down.
+ */
+export async function refreshAccessToken(): Promise<string | null> {
+  const outcome = await refreshSession();
+  return outcome.status === 'ok' ? outcome.access : null;
 }
 
 // --- client -----------------------------------------------------------------
@@ -235,12 +278,15 @@ api.interceptors.response.use(
       getRefreshToken()
     ) {
       config.__didAuthRetry = true;
-      const token = await refreshAccessToken();
-      if (token) {
-        config.headers.set('Authorization', `Bearer ${token}`);
+      const outcome = await refreshSession();
+      if (outcome.status === 'ok') {
+        config.headers.set('Authorization', `Bearer ${outcome.access}`);
         return api.request(config);
       }
-      clearSession();
+      // ONLY an authoritative refusal ends the session. If the refresh could not reach the
+      // server (offline, timeout, cold start, 5xx), the session is still valid — surface a
+      // retryable error and let the user stay signed in.
+      if (outcome.status === 'rejected') clearSession();
       return Promise.reject(normalizeError(error));
     }
 

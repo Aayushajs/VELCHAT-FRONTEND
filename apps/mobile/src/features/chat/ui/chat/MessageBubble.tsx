@@ -6,7 +6,9 @@
  *
  * Props are PRIMITIVES, not the DB row: WatermelonDB mutates its cached model in place, so a
  * memoised row keyed on the object reference would never see sending→sent→read. Passing the
- * mutable fields (state, contentPlain, createdAt) as primitives makes the memo correct.
+ * mutable fields (state, contentPlain, time) as primitives makes the memo correct. The `time`
+ * label arrives already formatted — ICU formatting is done once per emission by the screen,
+ * never per row per render (§R4).
  */
 import React from 'react';
 import { View, Pressable } from 'react-native';
@@ -19,16 +21,6 @@ const BUBBLE_MAX_WIDTH = '80%';
 const TAIL_RADIUS = 4;
 const GAP_WITHIN_RUN = 2;
 const GAP_BETWEEN_RUNS = 10;
-
-function compactTime(ts: number): string {
-  const d = new Date(ts);
-  if (Number.isNaN(d.getTime())) return '';
-  return d.toLocaleTimeString(undefined, {
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-  });
-}
 
 /**
  * Per-state send indicator for MY messages: a clock while sending, one check when sent,
@@ -92,7 +84,8 @@ interface MessageBubbleProps {
   contentPlain: string;
   mine: boolean;
   state: string;
-  createdAt: number;
+  /** Pre-formatted time-of-day (see `compactTime`) — not a timestamp. */
+  time: string;
   clientMsgId: string;
   firstOfRun: boolean;
   dateLabel: string | null;
@@ -103,7 +96,7 @@ function MessageBubbleBase({
   contentPlain,
   mine,
   state,
-  createdAt,
+  time,
   clientMsgId,
   firstOfRun,
   dateLabel,
@@ -160,7 +153,7 @@ function MessageBubbleBase({
                 opacity: mine ? 0.75 : 1,
               }}
             >
-              {compactTime(createdAt)}
+              {time}
             </Text>
             {mine ? (
               <SendStatus state={state} onRetry={() => onRetry(clientMsgId)} />

@@ -4,23 +4,34 @@
  * to the top, then most-recent; unread count as a brand pill. Instant open (DB-backed).
  */
 import React, { useCallback } from 'react';
-import { View, Pressable, Image } from 'react-native';
+import { View, Pressable, Image, type ViewStyle } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useTheme } from '../../../theme';
 import { useTranslation } from '../../../i18n';
-import { Text, UserIcon, ChatIcon, ChatPlusIcon } from '../../../design-system';
+import {
+  Text,
+  UserIcon,
+  ChatIcon,
+  ChatPlusIcon,
+  spacing,
+} from '../../../design-system';
 import { useTypingUser } from '../../../core';
 import { useContactAvatar } from '../../user';
 import type { RootStackParamList } from '../../../navigation/types';
-import { useConversations } from '../hooks/useConversations';
+import {
+  useConversations,
+  type ConversationRowVM,
+} from '../hooks/useConversations';
 import { useConversationPeer } from '../hooks/useConversationPeer';
 
-// The row type flows from the hook — the UI layer never reaches into infra directly.
-type ConversationItem = ReturnType<typeof useConversations>[number];
-
 const AVATAR = 54;
+
+// Hoisted: an inline literal is a fresh prop identity on every render, which invalidates
+// FlashList's internal memoisation of the scroll container. `spacing` is the same static
+// token the theme carries, so the rendered padding is unchanged.
+const LIST_CONTENT_STYLE: ViewStyle = { paddingVertical: spacing.xs };
 
 // Cheerful, stable per-name colour so a no-photo avatar is a coloured initial (WhatsApp-style).
 const AVATAR_COLORS = [
@@ -40,49 +51,44 @@ function avatarColor(name: string): string {
   return AVATAR_COLORS[h % AVATAR_COLORS.length] ?? '#7C3AED';
 }
 
-/** Compact WhatsApp-style timestamp: HH:MM today, else a short date. */
-function timeLabel(ts?: number): string {
-  if (!ts) return '';
-  const d = new Date(ts);
-  if (Number.isNaN(d.getTime())) return '';
-  const now = new Date();
-  if (d.toDateString() === now.toDateString()) {
-    return d.toLocaleTimeString(undefined, {
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-    });
-  }
-  const yesterday = new Date(now);
-  yesterday.setDate(now.getDate() - 1);
-  if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
-  return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+interface ConversationRowProps {
+  id: string;
+  name: string | undefined;
+  preview: string;
+  time: string;
+  unreadCount: number;
+  isDm: boolean;
+  onOpen: (id: string, name?: string) => void;
 }
 
-// Memoised so a message arriving in ANY conversation (which re-emits the whole list)
-// only re-renders rows whose own fields changed — not every visible row. `onOpen` is a
-// stable handler from the parent, so prop identity holds across list re-emits.
-const Row = React.memo(function Row({
-  item,
+// Props are PRIMITIVES, not the DB row: WatermelonDB mutates its cached model in place and
+// re-emits the same reference, so a memo keyed on the model would never see this row's own
+// changes (unread cleared, a new preview on the chat already at the top). Memoised so a
+// message arriving in ANY conversation only re-renders the rows that actually changed.
+// `onOpen` is a stable handler from the parent, so prop identity holds across re-emits.
+function ConversationRowBase({
+  id,
+  name,
+  preview,
+  time,
+  unreadCount,
+  isDm,
   onOpen,
-}: {
-  item: ConversationItem;
-  onOpen: (id: string, name?: string) => void;
-}): React.JSX.Element {
+}: ConversationRowProps): React.JSX.Element {
   const t = useTheme();
   const { t: tr } = useTranslation();
-  const initial = (item.name ?? '?').trim().charAt(0).toUpperCase();
-  const unread = item.unreadCount > 0;
+  const initial = (name ?? '?').trim().charAt(0).toUpperCase();
+  const unread = unreadCount > 0;
   // Typing wins over the last-message preview for this conversation (§C4, ephemeral store).
-  const typing = useTypingUser(item.id) !== null;
+  const typing = useTypingUser(id) !== null;
   // The other user's VelChat profile photo (DMs only), cached — else a colourful initial.
-  const peer = useConversationPeer(item.type === 'dm' ? item.id : undefined);
+  const peer = useConversationPeer(isDm ? id : undefined);
   const dp = useContactAvatar(peer);
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={item.name ?? 'Chat'}
-      onPress={() => onOpen(item.id, item.name)}
+      accessibilityLabel={name ?? 'Chat'}
+      onPress={() => onOpen(id, name)}
       style={({ pressed }) => ({
         flexDirection: 'row',
         alignItems: 'center',
@@ -99,7 +105,7 @@ const Row = React.memo(function Row({
           borderRadius: AVATAR / 2,
           backgroundColor:
             initial && initial !== '?'
-              ? avatarColor(item.name ?? '')
+              ? avatarColor(name ?? '')
               : t.colors.bgSubtle,
           alignItems: 'center',
           justifyContent: 'center',
@@ -128,7 +134,7 @@ const Row = React.memo(function Row({
             numberOfLines={1}
             style={{ flex: 1, fontSize: 17, color: t.colors.textPrimary }}
           >
-            {item.name ?? '—'}
+            {name ?? '—'}
           </Text>
           <Text
             variant="caption"
@@ -136,7 +142,7 @@ const Row = React.memo(function Row({
               color: unread ? t.colors.brandFrom : t.colors.textTertiary,
             }}
           >
-            {timeLabel(item.lastMessageAt)}
+            {time}
           </Text>
         </View>
         <View
@@ -161,7 +167,7 @@ const Row = React.memo(function Row({
               numberOfLines={1}
               style={{ flex: 1, fontSize: 14 }}
             >
-              {item.lastMessagePreview ?? ''}
+              {preview}
             </Text>
           )}
           {unread ? (
@@ -180,7 +186,7 @@ const Row = React.memo(function Row({
                 variant="caption"
                 style={{ color: t.colors.actionFg, fontSize: 12 }}
               >
-                {item.unreadCount > 99 ? '99+' : item.unreadCount}
+                {unreadCount > 99 ? '99+' : unreadCount}
               </Text>
             </View>
           ) : null}
@@ -188,14 +194,16 @@ const Row = React.memo(function Row({
       </View>
     </Pressable>
   );
-});
+}
+
+export const ConversationRow = React.memo(ConversationRowBase);
 
 export function ChatsList(): React.JSX.Element {
   const t = useTheme();
   const { t: tr } = useTranslation();
   const navigation =
     useNavigation<NativeStackNavigationProp<RootStackParamList>>();
-  const rows = useConversations();
+  const { rows, loaded } = useConversations();
   const onOpen = useCallback(
     (id: string, name?: string) => {
       navigation.navigate('Chat', { conversationId: id, name });
@@ -206,15 +214,33 @@ export function ChatsList(): React.JSX.Element {
     navigation.navigate('NewChat');
   }, [navigation]);
   const renderItem = useCallback(
-    ({ item }: { item: ConversationItem }) => (
-      <Row item={item} onOpen={onOpen} />
+    ({ item }: { item: ConversationRowVM }) => (
+      <ConversationRow
+        id={item.id}
+        name={item.name}
+        preview={item.preview}
+        time={item.time}
+        unreadCount={item.unread}
+        isDm={item.type === 'dm'}
+        onOpen={onOpen}
+      />
     ),
     [onOpen],
   );
 
   return (
     <View style={{ flex: 1, backgroundColor: t.colors.bgBase }}>
-      {rows.length === 0 ? (
+      {/* Nothing until the first DB emission — an ungated empty state flashes "no chats
+          yet" on every cold start / tab mount before the rows land. */}
+      {rows.length > 0 ? (
+        <FlashList
+          data={rows}
+          keyExtractor={item => item.id}
+          renderItem={renderItem}
+          contentContainerStyle={LIST_CONTENT_STYLE}
+          showsVerticalScrollIndicator={false}
+        />
+      ) : loaded ? (
         <View
           style={{
             flex: 1,
@@ -236,15 +262,7 @@ export function ChatsList(): React.JSX.Element {
             {tr('chat.emptySub')}
           </Text>
         </View>
-      ) : (
-        <FlashList
-          data={rows}
-          keyExtractor={item => item.id}
-          renderItem={renderItem}
-          contentContainerStyle={{ paddingVertical: t.spacing.xs }}
-          showsVerticalScrollIndicator={false}
-        />
-      )}
+      ) : null}
 
       {/* Compose FAB — the entry point to start a new chat (§F2). */}
       <Pressable

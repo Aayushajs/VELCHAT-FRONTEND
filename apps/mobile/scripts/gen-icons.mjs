@@ -1,7 +1,6 @@
-// Generates Android and iOS launcher icons from brand/owl-icon.svg.
-// The owl mark is trimmed to its bounds and centered on a white field. Produces
-// Android legacy/adaptive icons and every iOS AppIcon size, ready for release.
-// The adaptive foreground doubles as the Android-12 splash icon.
+// Generates Android and iOS icon families from the single VelChat brand mark.
+// The app tile is always pure black like the approved mark. Android gets a
+// correctly padded adaptive foreground; iOS gets opaque square source files.
 //
 // Usage: pnpm --filter @velchat/mobile icons
 import sharp from 'sharp';
@@ -14,7 +13,7 @@ const appRoot = path.resolve(
   '..',
 );
 const repoRoot = path.resolve(appRoot, '..', '..');
-const SRC = path.join(repoRoot, 'brand', 'owl-icon.svg');
+const SRC = path.join(repoRoot, 'brand', 'velchat-mark.svg');
 const RES = path.join(appRoot, 'android', 'app', 'src', 'main', 'res');
 const IOS_APP_ICON = path.join(
   appRoot,
@@ -23,7 +22,20 @@ const IOS_APP_ICON = path.join(
   'Images.xcassets',
   'AppIcon.appiconset',
 );
-const JS_SPLASH = path.join(appRoot, 'src', 'app', 'assets', 'owl-splash.png');
+const JS_SPLASH = path.join(
+  appRoot,
+  'src',
+  'app',
+  'assets',
+  'velchat-mark.png',
+);
+const JS_APP_TILE = path.join(
+  appRoot,
+  'src',
+  'design-system',
+  'assets',
+  'velchat-icon.png',
+);
 const IOS_SPLASH = path.join(
   appRoot,
   'ios',
@@ -31,7 +43,7 @@ const IOS_SPLASH = path.join(
   'Images.xcassets',
   'SplashLogo.imageset',
 );
-const WHITE = { r: 255, g: 255, b: 255, alpha: 1 };
+const BLACK = { r: 0, g: 0, b: 0, alpha: 1 };
 const TRANSPARENT = { r: 0, g: 0, b: 0, alpha: 0 };
 
 // Legacy launcher px per density; adaptive foreground is 108dp (2.25x the legacy 48).
@@ -90,18 +102,20 @@ async function main() {
   for (const [density, px] of Object.entries(LEGACY)) {
     const dir = path.join(RES, `mipmap-${density}`);
     mkdirSync(dir, { recursive: true });
-    const square = await onField(logo, px, 0.86, WHITE); // full-bleed logo, small white margin
+    // 64% gives the mark enough presence without Android's launcher masks
+    // crowding the rounded ends. It remains inside the 66dp adaptive safe area.
+    const square = await onField(logo, px, 0.64, BLACK);
     writeFileSync(path.join(dir, 'ic_launcher.png'), square);
     writeFileSync(
       path.join(dir, 'ic_launcher_round.png'),
       await circleMask(square, px),
     );
     // Adaptive/splash foreground: logo on transparent (system draws the bg + mask).
-    const fg = await onField(logo, ADAPTIVE[density], 0.72, TRANSPARENT);
+    const fg = await onField(logo, ADAPTIVE[density], 0.6, TRANSPARENT);
     writeFileSync(path.join(dir, 'ic_launcher_foreground.png'), fg);
   }
 
-  // Adaptive icon (API 26+): white background + logo foreground.
+  // Adaptive icon (API 26+): black background + transparent white mark.
   const v26 = path.join(RES, 'mipmap-anydpi-v26');
   mkdirSync(v26, { recursive: true });
   const adaptiveXml = `<?xml version="1.0" encoding="utf-8"?>
@@ -118,7 +132,7 @@ async function main() {
   mkdirSync(valuesDir, { recursive: true });
   writeFileSync(
     path.join(valuesDir, 'ic_launcher_background.xml'),
-    `<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#FFFFFF</color>\n</resources>\n`,
+    `<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#000000</color>\n</resources>\n`,
   );
 
   // iOS requires opaque, square PNGs; iOS applies its own rounded-corner mask.
@@ -126,14 +140,18 @@ async function main() {
   for (const [filename, px] of IOS_ICONS) {
     writeFileSync(
       path.join(IOS_APP_ICON, filename),
-      await onField(logo, px, 0.78, WHITE),
+      await onField(logo, px, 0.64, BLACK),
     );
   }
 
-  // One transparent source is shared by the React Native and iOS launch screens.
-  const splashLogo = await onField(logo, 512, 0.76, TRANSPARENT);
+  // Transparent mark over the native/React black launch fields.
+  const splashLogo = await onField(logo, 512, 0.68, TRANSPARENT);
   mkdirSync(path.dirname(JS_SPLASH), { recursive: true });
   writeFileSync(JS_SPLASH, splashLogo);
+  // Header usage needs the exact black tile rather than a white mark over an
+  // arbitrary screen color, so it cannot disappear in either app theme.
+  mkdirSync(path.dirname(JS_APP_TILE), { recursive: true });
+  writeFileSync(JS_APP_TILE, await onField(logo, 512, 0.64, BLACK));
   mkdirSync(IOS_SPLASH, { recursive: true });
   writeFileSync(path.join(IOS_SPLASH, 'SplashLogo.png'), splashLogo);
   writeFileSync(
@@ -151,7 +169,7 @@ async function main() {
   );
 
   console.log(
-    'OK  Android and iOS launcher icons plus app-open splash art generated from brand/owl-icon.svg (rebuild to see them).',
+    'OK  Android and iOS launcher icons, native splash art, and in-app brand assets generated from brand/velchat-mark.svg (rebuild to see them).',
   );
 }
 

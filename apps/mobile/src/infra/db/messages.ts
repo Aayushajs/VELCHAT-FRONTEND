@@ -35,7 +35,7 @@ export function observeMessages(conversationId: string) {
 }
 
 /** A short client message id (server seq is assigned later, on ACK). */
-function newClientMsgId(): string {
+export function newClientMsgId(): string {
   return `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
@@ -140,19 +140,49 @@ export async function applyServerMessages(
   const convs = db.get<Conversation>('conversations');
   const now = Date.now();
   const sorted = [...servers].sort((a, b) => a.seq - b.seq);
+  // Look the whole batch up in TWO queries instead of two per row. The per-row version ran 2N
+  // serialised SQLite reads INSIDE the write transaction, holding the writer lock the entire
+  // time — so a 100-row backfill blocked every other write behind it, including the optimistic
+  // send, and the composer visibly froze the moment a catch-up landed.
+  const clientIds = sorted
+    .map(s => s.clientMsgId)
+    .filter((id): id is string => typeof id === 'string' && id.length > 0);
+  const seqs = sorted.map(s => s.seq);
+  const convIds = [...new Set(sorted.map(s => s.conversationId))];
+
+  const [existingByClient, existingBySeq] = await Promise.all([
+    clientIds.length > 0
+      ? msgs.query(Q.where('client_msg_id', Q.oneOf(clientIds))).fetch()
+      : Promise.resolve([] as Message[]),
+    msgs
+      .query(
+        Q.where('conversation_id', Q.oneOf(convIds)),
+        Q.where('seq', Q.oneOf(seqs)),
+      )
+      .fetch(),
+  ]);
+
+  const byClientId = new Map<string, Message>();
+  for (const row of existingByClient) {
+    if (row.clientMsgId) byClientId.set(row.clientMsgId, row);
+  }
+  const bySeqKey = new Map<string, Message[]>();
+  for (const row of existingBySeq) {
+    const key = `${row.conversationId}#${String(row.seq)}`;
+    const list = bySeqKey.get(key);
+    if (list) list.push(row);
+    else bySeqKey.set(key, [row]);
+  }
+
   await db.write(async () => {
     const ops: Model[] = [];
     const bumps = new Map<string, ConvBump>();
     for (const s of sorted) {
-      const byClient = s.clientMsgId
-        ? await msgs.query(Q.where('client_msg_id', s.clientMsgId)).fetch()
-        : [];
-      const bySeq = await msgs
-        .query(
-          Q.where('conversation_id', s.conversationId),
-          Q.where('seq', s.seq),
-        )
-        .fetch();
+      const clientRow = s.clientMsgId
+        ? byClientId.get(s.clientMsgId)
+        : undefined;
+      const byClient = clientRow ? [clientRow] : [];
+      const bySeq = bySeqKey.get(`${s.conversationId}#${String(s.seq)}`) ?? [];
       const decision = reconcileDecision({
         hasClientMsgIdRow: byClient.length > 0,
         hasSeqRow: bySeq.length > 0,
@@ -298,7 +328,15 @@ export async function markMessageSent(
   });
 }
 
-/** Surface a permanently-failed send in the UI (retry affordance) — state → `failed`. */
+/**
+ * Surface a permanently-failed send in the UI (retry affordance) — state → `failed`.
+ *
+ * Guarded the same way `markMessageSent` and the inbound reconcile are: only a message still
+ * in flight may fail. Sends are idempotent server-side, so a row can be acknowledged (even read
+ * by the peer) while its outbox row survives a mid-ack crash and gets re-driven; without this
+ * guard a later transport failure would flip a message the recipient has ALREADY READ into a red
+ * "failed — tap to retry" bubble. Receipt state only ever moves forward.
+ */
 export async function markMessageFailed(clientMsgId: string): Promise<void> {
   const db = getDatabase();
   const msgs = db.get<Message>('messages');
@@ -308,6 +346,7 @@ export async function markMessageFailed(clientMsgId: string): Promise<void> {
       .fetch();
     const row = mine[0];
     if (!row) return;
+    if (row.state !== 'sending' && row.state !== 'failed') return;
     await row.update(m => {
       m.state = 'failed';
     });
@@ -359,15 +398,6 @@ export async function applyReceipt(
   const meId = getAccountId();
   if (meId === undefined) return;
   const db = getDatabase();
-  const rows = await db
-    .get<Message>('messages')
-    .query(
-      Q.where('conversation_id', conversationId),
-      Q.where('sender_id', meId),
-      Q.where('seq', Q.gt(0)),
-      Q.where('seq', Q.lte(upToSeq)),
-    )
-    .fetch();
   const rank: Record<string, number> = {
     sending: 0,
     sent: 1,
@@ -375,7 +405,22 @@ export async function applyReceipt(
     read: 3,
   };
   const target = rank[state] ?? 0;
-  const toUpdate = rows.filter(r => (rank[r.state] ?? 0) < target);
+  // Only states BELOW the target can move. Receipts are cumulative, so `upToSeq` marches toward
+  // the conversation maximum — without this predicate a chatty peer's every receipt materialised
+  // every message we had ever sent in that conversation (tens of thousands of model instances in
+  // a long DM) just to find the one or two rows that actually needed updating.
+  const behind = Object.keys(rank).filter(k => (rank[k] ?? 0) < target);
+  if (behind.length === 0) return;
+  const toUpdate = await db
+    .get<Message>('messages')
+    .query(
+      Q.where('conversation_id', conversationId),
+      Q.where('sender_id', meId),
+      Q.where('seq', Q.gt(0)),
+      Q.where('seq', Q.lte(upToSeq)),
+      Q.where('state', Q.oneOf(behind)),
+    )
+    .fetch();
   if (toUpdate.length === 0) return;
   await db.write(async () => {
     await db.batch(

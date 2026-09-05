@@ -4,33 +4,25 @@
  * onboarding→home flicker. Themed (light/dark).
  */
 import React from 'react';
-import { View, ActivityIndicator, Image } from 'react-native';
-import { useTheme } from '../theme';
-import { Text } from '../design-system';
-import OWL_SPLASH from './assets/owl-splash.png';
+import { View, Image } from 'react-native';
+import VELCHAT_MARK from './assets/velchat-mark.png';
 
 export function Splash(): React.JSX.Element {
-  const t = useTheme();
   return (
     <View
       style={{
         flex: 1,
-        backgroundColor: t.colors.bgBase,
+        backgroundColor: '#000000',
         alignItems: 'center',
         justifyContent: 'center',
-        gap: t.spacing.xl,
       }}
     >
       <Image
-        source={OWL_SPLASH}
+        source={VELCHAT_MARK}
         accessibilityLabel="VelChat"
         style={{ width: 132, height: 132 }}
         resizeMode="contain"
       />
-      <Text variant="title" style={{ color: t.colors.textPrimary }}>
-        VelChat
-      </Text>
-      <ActivityIndicator color={t.colors.textSecondary} />
     </View>
   );
 }

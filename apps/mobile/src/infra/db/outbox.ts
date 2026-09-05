@@ -11,7 +11,8 @@
  */
 import { Q } from '@nozbe/watermelondb';
 import { getDatabase } from './database';
-import { Outbox } from './models';
+import { Outbox, Message, Conversation } from './models';
+import { newClientMsgId } from './messages';
 import { backoffMs, nextOutboxRetry } from './syncLogic';
 import type { SendMessageInput } from '../network/chat';
 
@@ -85,6 +86,84 @@ export function enqueueSend(
         o.updatedAt = now;
       });
     });
+  });
+}
+
+/**
+ * Compose a message: write the optimistic bubble AND its outbox row in ONE transaction (§L6/§L7).
+ *
+ * A send is a single fact, so it cannot be two writes. Split across two transactions, a process
+ * death in between — or the second write simply throwing under disk pressure — strands a message
+ * row in `sending` with nothing queued to transmit it. Crash recovery only repairs OUTBOX rows,
+ * so nothing ever revisits that bubble: it is never sent, never fails, and keeps its clock icon
+ * across every relaunch with no retry affordance. One transaction makes that state unreachable.
+ *
+ * Returns the `client_msg_id` (the idempotency key the server dedupes on), or `null` when there
+ * is nothing legitimate to send.
+ */
+export function enqueueOptimisticSend(
+  conversationId: string,
+  text: string,
+  senderId: string,
+): Promise<string | null> {
+  const body = text.trim();
+  // A blank body has nothing to deliver. A blank sender is worse than nothing: the backend
+  // refuses a senderId that disagrees with the token, so queueing one burns every retry on a
+  // guaranteed 4xx and ends as a red bubble the user can never fix.
+  if (!body || !senderId) return Promise.resolve(null);
+
+  return withOutboxLock(async () => {
+    const db = getDatabase();
+    const now = Date.now();
+    const clientMsgId = newClientMsgId();
+    const payload: SendMessageInput = {
+      conversationId,
+      senderId,
+      clientMsgId,
+      type: 'text',
+      content: body,
+    };
+    const json = JSON.stringify(payload);
+
+    await db.write(async () => {
+      await db.get<Message>('messages').create(m => {
+        m.clientMsgId = clientMsgId;
+        m.conversationId = conversationId;
+        m.senderId = senderId;
+        m.type = 'text';
+        m.contentPlain = body;
+        m.state = 'sending';
+        m.deleted = false;
+        m.viewOnce = false;
+        m.starred = false;
+        m.createdAt = now;
+      });
+      await db.get<Outbox>('outbox').create(o => {
+        o.kind = KIND_SEND;
+        o.conversationId = conversationId;
+        o.payload = json;
+        o.state = 'queued';
+        o.attempts = 0;
+        o.nextAttemptAt = now;
+        o.createdAt = now;
+        o.updatedAt = now;
+      });
+      // The conversation row may not exist locally yet (conversations are owned server-side) —
+      // bump the list preview only when it does.
+      const conv = await db
+        .get<Conversation>('conversations')
+        .find(conversationId)
+        .catch(() => null);
+      if (conv) {
+        await conv.update(c => {
+          c.lastMessagePreview = body;
+          c.lastMessageAt = now;
+          c.unreadCount = 0;
+          c.updatedAt = now;
+        });
+      }
+    });
+    return clientMsgId;
   });
 }
 
@@ -174,6 +253,15 @@ export function markFailed(
   id: string,
   error: string,
   attempts: number,
+  /**
+   * Override the attempt-count verdict with the CAUSE of the failure.
+   *
+   * Attempts alone are the wrong signal: eight failures because the phone is in a tunnel say
+   * nothing bad about the message, while one 400 says everything. `false` keeps the row retrying
+   * (clock icon, WhatsApp behaviour); `true` retires it immediately so the user gets the retry
+   * affordance now instead of after eight pointless replays of a rejected payload.
+   */
+  permanent?: boolean,
 ): Promise<void> {
   return withOutboxLock(async () => {
     const db = getDatabase();
@@ -181,7 +269,12 @@ export function markFailed(
     const row = await col.find(id).catch(() => null);
     if (!row) return;
     const now = Date.now();
-    const { state } = nextOutboxRetry(attempts);
+    const state =
+      permanent === undefined
+        ? nextOutboxRetry(attempts).state
+        : permanent
+          ? 'failed'
+          : 'queued';
     const retryAt = state === 'queued' ? now + backoffMs(attempts) : undefined;
     await db.write(async () => {
       await row.update(o => {

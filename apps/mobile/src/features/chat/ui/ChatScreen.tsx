@@ -19,6 +19,7 @@ import {
   type EmitterSubscription,
   type NativeSyntheticEvent,
   type NativeScrollEvent,
+  type ViewStyle,
 } from 'react-native';
 import { FlashList, type FlashListRef } from '@shopify/flash-list';
 import {
@@ -29,7 +30,7 @@ import {
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useTheme } from '../../../theme';
 import { useTranslation } from '../../../i18n';
-import { Screen } from '../../../design-system';
+import { Screen, spacing } from '../../../design-system';
 import type { RootStackParamList } from '../../../navigation/types';
 import {
   useMessages,
@@ -41,12 +42,42 @@ import { ChatHeader } from './chat/ChatHeader';
 import { Composer } from './chat/Composer';
 import { JumpToLatest } from './chat/JumpToLatest';
 import { MessageBubble } from './chat/MessageBubble';
-import { dayCategory, startsNewDay, startsNewRun } from './chat/chatModel';
-
-type Msg = ReturnType<typeof useMessages>['messages'][number];
+import {
+  compactTime,
+  dayCategory,
+  startsNewDay,
+  startsNewRun,
+} from './chat/chatModel';
 
 /** Show the FAB once scrolled this far from the newest message (inverted list: y≈0 = bottom). */
 const JUMP_THRESHOLD = 120;
+
+// Hoisted: an inline literal is a fresh prop identity on every render. Same value as before
+// (`spacing` is the static token the theme carries), so the rendered padding is unchanged.
+const LIST_CONTENT_STYLE: ViewStyle = { paddingVertical: spacing.xs };
+
+/**
+ * A message as the list renders it: grouping decisions and ICU labels resolved ONCE per DB
+ * emission, not per row per render. Doing it inline made `renderItem` depend on `messages`,
+ * so every emission handed every mounted cell a new callback identity (full re-render of the
+ * visible window) and re-ran `startsNewRun`/`startsNewDay` — up to 4 `Date` allocations per
+ * row, every time (§R4).
+ */
+interface MessageRow {
+  readonly id: string;
+  readonly clientMsgId: string;
+  readonly contentPlain: string;
+  readonly mine: boolean;
+  readonly state: string;
+  readonly time: string;
+  readonly firstOfRun: boolean;
+  readonly dateLabel: string | null;
+}
+
+/** Mine/theirs bubbles are structurally different — they must not share a recycle pool. */
+function messageItemType(item: MessageRow): string {
+  return item.mine ? 'mine' : 'theirs';
+}
 
 export function ChatScreen(): React.JSX.Element {
   const t = useTheme();
@@ -74,7 +105,7 @@ export function ChatScreen(): React.JSX.Element {
   // would rebuild every chip label) and needn't track the midnight rollover mid-session.
   const now = useMemo(() => Date.now(), []);
 
-  const listRef = useRef<FlashListRef<Msg>>(null);
+  const listRef = useRef<FlashListRef<MessageRow>>(null);
   const showJumpRef = useRef(false);
   const [showJump, setShowJump] = useState(false);
 
@@ -131,22 +162,37 @@ export function ChatScreen(): React.JSX.Element {
     [now, tr],
   );
 
+  // One grouping pass per emission (the window is bounded — `observeMessages` takes 50).
+  const rows = useMemo<MessageRow[]>(
+    () =>
+      messages.map((m, i) => ({
+        id: m.id,
+        clientMsgId: m.clientMsgId,
+        contentPlain: m.contentPlain ?? '',
+        mine: m.senderId === meId,
+        state: m.state,
+        time: compactTime(m.createdAt),
+        firstOfRun: startsNewRun(messages, i),
+        dateLabel: startsNewDay(messages, i) ? dateLabelFor(m.createdAt) : null,
+      })),
+    [messages, meId, dateLabelFor],
+  );
+
+  // Depends only on stable references, so a new emission no longer re-renders every cell.
   const renderItem = useCallback(
-    ({ item, index }: { item: Msg; index: number }) => (
+    ({ item }: { item: MessageRow }) => (
       <MessageBubble
-        contentPlain={item.contentPlain ?? ''}
-        mine={item.senderId === meId}
+        contentPlain={item.contentPlain}
+        mine={item.mine}
         state={item.state}
-        createdAt={item.createdAt}
+        time={item.time}
         clientMsgId={item.clientMsgId}
-        firstOfRun={startsNewRun(messages, index)}
-        dateLabel={
-          startsNewDay(messages, index) ? dateLabelFor(item.createdAt) : null
-        }
+        firstOfRun={item.firstOfRun}
+        dateLabel={item.dateLabel}
         onRetry={retry}
       />
     ),
-    [messages, meId, retry, dateLabelFor],
+    [retry],
   );
 
   return (
@@ -157,13 +203,14 @@ export function ChatScreen(): React.JSX.Element {
         <View style={{ flex: 1, backgroundColor: t.colors.bgBase }}>
           <FlashList
             ref={listRef}
-            data={messages}
+            data={rows}
             inverted
             keyExtractor={m => m.id}
             renderItem={renderItem}
+            getItemType={messageItemType}
             onScroll={onScroll}
             scrollEventThrottle={16}
-            contentContainerStyle={{ paddingVertical: t.spacing.xs }}
+            contentContainerStyle={LIST_CONTENT_STYLE}
             showsVerticalScrollIndicator={false}
           />
           {showJump ? <JumpToLatest onPress={jumpToLatest} /> : null}

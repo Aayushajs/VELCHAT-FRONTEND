@@ -24,6 +24,7 @@ import {
   WS_CODE_UNAUTHORIZED,
   hasSession,
   getAccessToken,
+  refreshAccessToken,
   getAccountId,
   getConversationMembers,
   getPresence,
@@ -43,24 +44,50 @@ import {
   markMessageSending,
   maxSeqForConversation,
   applyReceipt,
-  enqueueSend,
+  enqueueOptimisticSend,
   claimNextDue,
   markAckd,
   markFailed,
   recoverStuckSends,
   requeueFailed,
   outboxStats,
-  nextOutboxRetry,
+  classifySendFailure,
   backoffMs,
-  sendMessageLocal,
   listConversationIds,
   clearUnread,
-  type SendMessageInput,
+  pendingReceiptFrames,
+  getDesired,
+  getSent,
+  noteDesired,
+  noteSent,
+  markDirty,
+  takeDirty,
 } from '../../infra';
 
 /** Lower/upper bounds for the outbox self-adjusting timer (never poll a hot loop). */
 const OUTBOX_MIN_DELAY_MS = 500;
 const OUTBOX_MAX_DELAY_MS = 30_000;
+/**
+ * How many times a 4001 may be answered with a token refresh before the engine concludes the
+ * session is genuinely dead. Bounded so a revoked session degrades to "no realtime" instead of
+ * an endless refresh↔connect loop hammering the gateway (the exact shape that earns a 429).
+ */
+const MAX_AUTH_REFRESH_ATTEMPTS = 2;
+/**
+ * Receipts are coalesced over this window before going out. A burst of inbound messages must cost
+ * ONE cumulative frame, not one per message: the gateway drops inbound frames above ~40/sec per
+ * connection, silently and shared, so a chatty group could otherwise starve `read` and `sync`.
+ */
+const RECEIPT_FLUSH_DELAY_MS = 250;
+/**
+ * Conversations backfilled concurrently on reconnect. Sequential catch-up leaves a 500-chat user
+ * "syncing" for minutes; unbounded fan-out is a self-inflicted burst against the edge limiter.
+ */
+const RESYNC_CONCURRENCY = 4;
+/** Matches the server's hard clamp — a full page means "there is more", so keep paging. */
+const BACKFILL_PAGE = 100;
+/** Safety stop for the paging loop: 100 pages = 10k messages in one conversation, per resync. */
+const MAX_BACKFILL_PAGES = 100;
 
 class SyncEngine {
   private socket: RealtimeSocket | null = null;
@@ -68,11 +95,22 @@ class SyncEngine {
   private appStateUnsub: (() => void) | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private outboxTimer: ReturnType<typeof setTimeout> | null = null;
+  private receiptTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * The conversation the user is currently looking at. Messages that land here are read the
+   * instant they arrive — that is what makes the peer's ticks turn blue live, and what stops the
+   * unread badge from climbing on the chat the user is staring at.
+   */
+  private activeConversationId: string | null = null;
   private reconnectAttempts = 0;
+  /** Consecutive 4001s answered with a refresh; reset once a socket actually opens. */
+  private authRefreshAttempts = 0;
   private online = false;
   private started = false;
   private stopped = true;
   private draining = false;
+  /** Set when the server rate-limits a send; no drain runs before it expires. */
+  private outboxCooldownUntil = 0;
   // Ephemeral realtime (§C4/§A15) — NEVER persisted. One owned expiry timer per typing
   // conversation; `activePresencePeers` maps an open DM → the peer we're watching.
   private readonly typingTimers = new Map<
@@ -124,7 +162,9 @@ class SyncEngine {
     }
     this.clearReconnectTimer();
     this.clearOutboxTimer();
+    this.clearReceiptTimer();
     this.clearAllTyping();
+    this.activeConversationId = null;
     this.activePresencePeers.clear();
     useRealtimeStore.getState().reset();
     const s = this.socket;
@@ -180,10 +220,15 @@ class SyncEngine {
     const socket = new RealtimeSocket({
       onOpen: () => {
         this.reconnectAttempts = 0;
+        // The token is proven good — re-arm the 4001 refresh budget for the next expiry.
+        this.authRefreshAttempts = 0;
         this.setConnState('connected');
         log.info('ws open');
       },
       onConnected: () => {
+        // Re-emit anything the peer still doesn't know BEFORE the catch-up: receipts owed from
+        // before the drop are the ones most likely to be showing a stale tick right now.
+        this.flushReceipts();
         void this.resyncAll();
         this.kickOutbox();
       },
@@ -217,10 +262,8 @@ class SyncEngine {
     log.info('ws closed', { code, reason });
     if (this.stopped) return;
     if (code === WS_CODE_UNAUTHORIZED) {
-      // Missing/invalid account_id/device_id on the socket — don't hammer with a bad token;
-      // a future connectivity change or app relaunch re-attempts with a fresh session.
       this.setConnState('disconnected');
-      log.warn('ws unauthorized (4001) — not reconnecting');
+      void this.recoverFromUnauthorized();
       return;
     }
     if (this.online && hasSession()) {
@@ -229,6 +272,40 @@ class SyncEngine {
     } else {
       this.setConnState('disconnected');
     }
+  }
+
+  /**
+   * A 4001 is the gateway refusing the handshake's token. The overwhelmingly common cause is an
+   * access token that EXPIRED WHILE THE APP WAS BACKGROUNDED — the token rides the connect URL,
+   * so unlike REST there is no interceptor to refresh it mid-flight. Treating that as fatal is
+   * what makes realtime silently dead until the user force-quits: the socket never retries, and
+   * `onNetwork`/`onForeground` only reconnect on a transition that may never come.
+   *
+   * So: refresh once (the refresh call is single-flight), then let the normal backoff reconnect
+   * with the fresh token. A genuinely revoked session fails the refresh and stays disconnected.
+   */
+  private async recoverFromUnauthorized(): Promise<void> {
+    if (this.stopped || !this.online || !hasSession()) return;
+    if (this.authRefreshAttempts >= MAX_AUTH_REFRESH_ATTEMPTS) {
+      log.warn(
+        'ws unauthorized (4001) — refresh exhausted, staying disconnected',
+      );
+      return;
+    }
+    this.authRefreshAttempts += 1;
+    const token = await refreshAccessToken().catch(() => null);
+    // The world may have moved while the refresh was in flight (stop/offline/logout).
+    if (this.stopped || !this.online || !hasSession()) return;
+    if (!token) {
+      log.warn(
+        'ws unauthorized (4001) — token refresh failed, staying disconnected',
+      );
+      return;
+    }
+    log.info('ws unauthorized (4001) — token refreshed, reconnecting');
+    this.setConnState('reconnecting');
+    this.reconnectAttempts = 0;
+    this.scheduleReconnect();
   }
 
   private onServerReconnect(): void {
@@ -254,6 +331,13 @@ class SyncEngine {
     }, delay);
   }
 
+  private clearReceiptTimer(): void {
+    if (this.receiptTimer !== null) {
+      clearTimeout(this.receiptTimer);
+      this.receiptTimer = null;
+    }
+  }
+
   private clearReconnectTimer(): void {
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
@@ -262,6 +346,20 @@ class SyncEngine {
   }
 
   // ── catch-up (reconnect backfill) ────────────────────────────────────────
+  /**
+   * Catch up every conversation after a reconnect. Four properties are deliberate:
+   *
+   *  - The conversation on screen goes FIRST. Everything else can settle in the background; the
+   *    one the user is staring at cannot.
+   *  - Bounded concurrency, not a sequential walk. At 200 ms RTT a 500-chat user would otherwise
+   *    sit in `syncing` for well over a minute before a single message appeared.
+   *  - A socket drop mid-catch-up must NOT abandon the tail. The backfill is plain REST and stays
+   *    valid without the socket; aborting meant that on a flapping link the far end of the
+   *    conversation list was never caught up, permanently.
+   *  - No per-conversation `sync` frame. The gateway only echoes that cursor back — it replays
+   *    nothing — so one frame per conversation was pure noise that consumed the ~40/sec inbound
+   *    budget and got real receipts dropped alongside it.
+   */
   private async resyncAll(): Promise<void> {
     if (this.stopped) return;
     this.setConnState('syncing');
@@ -271,18 +369,142 @@ class SyncEngine {
     } catch {
       ids = [];
     }
-    for (const id of ids) {
-      if (this.stopped || !this.socket) break;
-      try {
-        const cursor = await maxSeqForConversation(id);
-        this.socket?.send('sync', { conversationId: id, cursor });
-        const missed = await fetchMessagesAfter(id, cursor);
-        if (missed.length > 0) await applyServerMessages(missed);
-      } catch (e) {
-        log.warn('resync conversation failed', { id, reason: String(e) });
+    const active = this.activeConversationId;
+    if (active && ids.includes(active)) {
+      ids = [active, ...ids.filter(id => id !== active)];
+    }
+
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        if (this.stopped) return;
+        const i = next++;
+        if (i >= ids.length) return;
+        const id = ids[i];
+        if (id === undefined) return;
+        try {
+          await this.backfillConversation(id);
+        } catch (e) {
+          log.warn('resync conversation failed', { id, reason: String(e) });
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(RESYNC_CONCURRENCY, ids.length) }, worker),
+    );
+
+    // Anything the catch-up marked delivered goes out as one cumulative frame per conversation.
+    this.flushReceipts();
+    if (!this.stopped && this.socket) this.setConnState('live');
+  }
+
+  /**
+   * Pull everything past our local cursor for one conversation, PAGING until the server runs out.
+   * The server clamps `limit` to 100, so a single request silently truncates any longer gap — an
+   * 8-hour absence from a busy group used to restore the oldest 100 missed messages and leave the
+   * newest hundreds invisible until several more reconnect cycles happened to fill them in.
+   */
+  private async backfillConversation(conversationId: string): Promise<void> {
+    let cursor = await maxSeqForConversation(conversationId);
+    for (let page = 0; page < MAX_BACKFILL_PAGES; page++) {
+      if (this.stopped) return;
+      const batch = await fetchMessagesAfter(
+        conversationId,
+        cursor,
+        BACKFILL_PAGE,
+      );
+      if (batch.length === 0) return;
+      await applyServerMessages(batch);
+      const highest = batch.reduce(
+        (max, m) => (m.seq > max ? m.seq : max),
+        cursor,
+      );
+      const me = getAccountId();
+      const inbound = batch.filter(m => m.senderId !== me);
+      if (inbound.length > 0) {
+        // Received while we were away — the sender is still waiting on a second grey tick.
+        this.noteDelivered(
+          conversationId,
+          inbound.reduce((max, m) => (m.seq > max ? m.seq : max), 0),
+        );
+      }
+      if (highest <= cursor) return; // server isn't advancing — stop rather than spin
+      cursor = highest;
+      if (batch.length < BACKFILL_PAGE) return; // short page = caught up
+    }
+    log.warn('backfill hit the page cap — more history remains', {
+      conversationId,
+    });
+  }
+
+  // ── receipts (§F2/§C5) ───────────────────────────────────────────────────
+  /**
+   * Record that a message is on this device. Called from BOTH receive paths — the live frame and
+   * the REST catch-up — because a message that arrived while offline is just as delivered as one
+   * that arrived over the socket. Only emitting from the live path is why a night in airplane mode
+   * used to leave the sender on one grey tick forever, with nothing that could ever repair it.
+   */
+  private noteDelivered(conversationId: string, seq: number): void {
+    if (noteDesired(conversationId, { delivered: seq })) {
+      markDirty(conversationId);
+      this.scheduleReceiptFlush();
+    }
+  }
+
+  /** Record that the user has actually seen up to `seq` (blue ticks for the peer). */
+  private noteRead(conversationId: string, seq: number): void {
+    if (noteDesired(conversationId, { read: seq })) {
+      markDirty(conversationId);
+      this.scheduleReceiptFlush();
+    }
+  }
+
+  private scheduleReceiptFlush(): void {
+    if (this.stopped || this.receiptTimer !== null) return;
+    this.receiptTimer = setTimeout(() => {
+      this.receiptTimer = null;
+      void this.flushReceipts();
+    }, RECEIPT_FLUSH_DELAY_MS);
+  }
+
+  /**
+   * Emit the receipts still owed, one cumulative frame per state per conversation.
+   *
+   * `sent` advances ONLY when the transport accepted the frame. The socket drops sends silently
+   * when it isn't OPEN, so treating "we tried" as "they know" is exactly how a receipt vanishes
+   * into a reconnect. Anything unsent stays dirty and is re-derived on the next flush — which the
+   * reconnect path triggers, so a dropped frame costs one extra frame, never a stuck tick.
+   */
+  private flushReceipts(): void {
+    if (this.stopped) return;
+    const ids = takeDirty();
+    if (ids.length === 0) return;
+    for (const conversationId of ids) {
+      const desired = getDesired(conversationId);
+      const frames = pendingReceiptFrames(desired, getSent(conversationId));
+      if (frames.length === 0) continue;
+      for (const f of frames) {
+        const ok = this.socket?.send(f.state, {
+          conversationId,
+          seq: f.upToSeq,
+        });
+        if (ok) {
+          noteSent(conversationId, { [f.state]: f.upToSeq });
+        } else {
+          // Socket down or backpressured — keep it owed and retry on the next flush/reconnect.
+          markDirty(conversationId);
+        }
       }
     }
-    if (!this.stopped && this.socket) this.setConnState('live');
+  }
+
+  /**
+   * The chat screen tells the engine which conversation is on screen. While a conversation is
+   * active, every message that lands in it is read on arrival: the badge never climbs on a chat
+   * the user is looking at, and the sender sees blue ticks without the reader touching anything.
+   */
+  setActiveConversation(conversationId: string | null): void {
+    this.activeConversationId = conversationId;
   }
 
   // ── inbound frames ───────────────────────────────────────────────────────
@@ -308,10 +530,18 @@ class SyncEngine {
         }
       }
       if (m.senderId !== getAccountId()) {
-        this.socket?.send('delivered', {
-          conversationId: m.conversationId,
-          seq: m.seq,
-        });
+        this.noteDelivered(m.conversationId, m.seq);
+        // Landed in the chat the user is currently reading → it is read, now. Clearing the badge
+        // here is what stops it from climbing on the open conversation, and the read watermark is
+        // what turns the sender's ticks blue while they watch.
+        if (this.activeConversationId === m.conversationId) {
+          this.noteRead(m.conversationId, m.seq);
+          try {
+            await clearUnread(m.conversationId);
+          } catch {
+            // badge cosmetics only — never fail the inbound path over it
+          }
+        }
       }
     } catch (e) {
       log.warn('apply inbound message failed', { reason: String(e) });
@@ -363,6 +593,9 @@ class SyncEngine {
       if (this.recovery) await this.recovery;
       for (;;) {
         if (this.stopped || !this.online || !hasSession()) break;
+        // Rate limited a moment ago — walking the queue now just re-earns the 429 and burns an
+        // attempt on every message behind it.
+        if (Date.now() < this.outboxCooldownUntil) break;
         const item = await claimNextDue(Date.now());
         if (!item) break;
         try {
@@ -372,18 +605,15 @@ class SyncEngine {
         } catch (e) {
           const attempts = item.attempts + 1;
           const msg = isAppError(e) ? e.message : String(e);
-          await markFailed(item.id, msg, attempts);
-          if (nextOutboxRetry(attempts).state === 'failed') {
-            await markMessageFailed(item.clientMsgId);
+          // The CAUSE decides, not the attempt count: unreachable keeps the clock icon forever,
+          // a refusal of this message surfaces the retry affordance immediately.
+          const decision = classifySendFailure(e, attempts);
+          await markFailed(item.id, msg, attempts, decision.permanent);
+          if (decision.permanent) await markMessageFailed(item.clientMsgId);
+          if (decision.cooldownMs > 0) {
+            this.outboxCooldownUntil = Date.now() + decision.cooldownMs;
           }
-          // Transient (network/timeout/5xx) → stop this pass; the timer resumes when due.
-          // Non-retryable client error → keep draining other conversations.
-          const transient =
-            !isAppError(e) ||
-            e.kind === 'network' ||
-            e.kind === 'timeout' ||
-            e.kind === 'server';
-          if (transient) break;
+          if (decision.pauseDrain) break;
         }
       }
     } finally {
@@ -404,7 +634,8 @@ class SyncEngine {
     }
     if (stats.queued === 0) return; // idle — nothing to poll for
     const now = Date.now();
-    const dueAt = stats.nextDueAt ?? now;
+    // Never wake before a rate-limit cooldown expires, however soon the row claims to be due.
+    const dueAt = Math.max(stats.nextDueAt ?? now, this.outboxCooldownUntil);
     const delay = Math.max(
       OUTBOX_MIN_DELAY_MS,
       Math.min(OUTBOX_MAX_DELAY_MS, dueAt - now),
@@ -433,16 +664,14 @@ class SyncEngine {
     senderId: string,
     text: string,
   ): Promise<void> {
-    const clientMsgId = await sendMessageLocal(conversationId, text, senderId);
-    if (!clientMsgId) return;
-    const input: SendMessageInput = {
+    // ONE transaction for the bubble + its outbox row: a crash between two writes used to strand
+    // a message in `sending` that nothing would ever transmit or surface as failed.
+    const clientMsgId = await enqueueOptimisticSend(
       conversationId,
+      text,
       senderId,
-      clientMsgId,
-      type: 'text',
-      content: text.trim(),
-    };
-    await enqueueSend(conversationId, clientMsgId, input);
+    );
+    if (!clientMsgId) return;
     this.kickOutbox();
   }
 
@@ -453,10 +682,11 @@ class SyncEngine {
    */
   async markConversationRead(conversationId: string): Promise<void> {
     await clearUnread(conversationId);
-    if (!this.socket) return;
     try {
       const seq = await maxSeqForConversation(conversationId);
-      if (seq > 0) this.socket?.send('read', { conversationId, seq });
+      // Record it even with the socket down: the ledger is durable, so opening a chat offline
+      // still turns the sender's ticks blue as soon as we reconnect.
+      if (seq > 0) this.noteRead(conversationId, seq);
     } catch {
       // a missing cursor just means no read frame this time — the badge already cleared
     }

@@ -27,6 +27,7 @@ export {
 } from './messages';
 export {
   enqueueSend,
+  enqueueOptimisticSend,
   claimNextDue,
   markAckd,
   markFailed,
@@ -35,6 +36,8 @@ export {
   outboxStats,
 } from './outbox';
 export type { OutboxItem, OutboxStats } from './outbox';
+export { classifySendFailure } from './sendFailurePolicy';
+export type { SendFailureDecision } from './sendFailurePolicy';
 export {
   reconcileDecision,
   backoffMs,
@@ -49,6 +52,26 @@ export {
   sanitizeLikeQuery,
 } from './search';
 export type { ConversationSearchHit, MessageSearchHit } from './search';
+export {
+  pendingReceiptFrames,
+  mergeWatermark,
+  EMPTY_WATERMARKS,
+} from './receiptLedger';
+export type {
+  ReceiptWatermarks,
+  ReceiptState,
+  ReceiptFrame,
+} from './receiptLedger';
+export {
+  getDesired,
+  getSent,
+  noteDesired,
+  noteSent,
+  markDirty,
+  takeDirty,
+  hasDirty,
+  clearAllReceipts,
+} from './receiptStore';
 export {
   Conversation,
   Message,
