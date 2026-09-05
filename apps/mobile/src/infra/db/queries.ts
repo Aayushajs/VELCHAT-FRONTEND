@@ -28,7 +28,8 @@ export async function purgeAllLocalChat(): Promise<void> {
  * `observeWithColumns` so IN-PLACE field changes (unread cleared, preview updated) also
  * re-render — a plain `.observe()` under a `sortBy` only re-emits on reorder/identity.
  */
-export function observeConversations() {
+export function observeConversations(limit?: number) {
+  const bounds = limit !== undefined && limit > 0 ? [Q.take(limit)] : [];
   return getDatabase()
     .get<Conversation>('conversations')
     .query(
@@ -40,6 +41,11 @@ export function observeConversations() {
       Q.where('last_message_at', Q.gt(0)),
       Q.sortBy('is_pinned', Q.desc),
       Q.sortBy('last_message_at', Q.desc),
+      // A caller that only needs the top few (search's "frequent" strip) must say so. This query
+      // re-runs on EVERY write to its table, so while the search screen is open, materialising
+      // every conversation just to slice five of them paid the full list cost a second time —
+      // on every inbound message, tick and receipt.
+      ...bounds,
     )
     .observeWithColumns([
       'is_pinned',

@@ -94,14 +94,16 @@ export function useSearch(query: string): {
   useEffect(() => {
     let sub: { unsubscribe: () => void } | undefined;
     try {
-      sub = observeConversations().subscribe((rows: Conversation[]) => {
-        setFrequent(
-          rows.slice(0, FREQUENT_LIMIT).map(c => ({
-            id: c.id,
-            name: c.name ?? '',
-          })),
-        );
-      });
+      sub = observeConversations(FREQUENT_LIMIT).subscribe(
+        (rows: Conversation[]) => {
+          setFrequent(
+            rows.map(c => ({
+              id: c.id,
+              name: c.name ?? '',
+            })),
+          );
+        },
+      );
     } catch {
       setFrequent([]);
     }
