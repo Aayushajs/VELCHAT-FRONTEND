@@ -112,6 +112,13 @@ class SyncEngine {
   /** True while the app is backgrounded and the socket has been deliberately released. */
   private suspended = false;
   /**
+   * Whether a push channel can wake us. §M13's "no background WebSocket" rule is only safe
+   * BECAUSE push delivers while we sleep — without it, releasing the socket means the user
+   * simply stops receiving messages the moment the app leaves the foreground. So the rule is
+   * gated on the premise actually holding; `infra/push` sets this once FCM/APNs is registered.
+   */
+  private pushAvailable = false;
+  /**
    * The conversation the user is currently looking at. Messages that land here are read the
    * instant they arrive — that is what makes the peer's ticks turn blue live, and what stops the
    * unread badge from climbing on the chat the user is staring at.
@@ -151,6 +158,21 @@ class SyncEngine {
   // One-shot crash-recovery: resets outbox rows orphaned in `sending` by a prior kill.
   // The first drain awaits it so it can't claim behind a stuck row.
   private recovery: Promise<unknown> | null = null;
+
+  /**
+   * Declare that push can wake the app. Until this is true the engine keeps its socket while
+   * backgrounded, because dropping it would trade battery for undelivered messages.
+   */
+  setPushAvailable(available: boolean): void {
+    this.pushAvailable = available;
+    if (!available && this.suspended) {
+      // Push went away while we were asleep — come back up rather than stay deaf.
+      this.suspended = false;
+      this.clearSuspendTimer();
+      this.connect();
+      this.kickOutbox();
+    }
+  }
 
   /** Provide the profile lookup used to name a newly-arrived DM (called once, at startup). */
   setDisplayNameResolver(
@@ -407,6 +429,9 @@ class SyncEngine {
    */
   private scheduleSuspend(): void {
     if (this.stopped || this.suspended || this.suspendTimer !== null) return;
+    // No push channel = the socket IS the delivery path. Releasing it would save battery by
+    // making the app stop receiving messages, which is not a trade worth making.
+    if (!this.pushAvailable) return;
     this.suspendTimer = setTimeout(() => {
       this.suspendTimer = null;
       if (this.stopped) return;
