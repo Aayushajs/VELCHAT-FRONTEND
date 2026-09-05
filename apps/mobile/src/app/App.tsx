@@ -22,9 +22,10 @@ import {
   getAccountId,
 } from '../infra';
 import { RootNavigator } from '../navigation';
-import { startSync, stopSync } from '../domain/sync';
+import { startSync, stopSync, syncEngine } from '../domain/sync';
 import { prewarmContacts } from '../features/contacts';
 import { backfillInbox } from '../features/chat';
+import { getProfile } from '../features/user';
 import { useAuthBootstrap } from '../features/auth';
 import { ErrorBoundary } from './ErrorBoundary';
 import { Splash } from './Splash';
@@ -67,6 +68,11 @@ export default function App(): React.JSX.Element {
     if (acc) void prewarmContacts();
     // Restore the chat list from the server (re-login / reinstall / post-logout wipe) so the
     // inbox isn't empty — re-discovers conversations + pulls their recent messages (best-effort).
+    // Give the sync engine a way to name a DM that arrives from someone new (§M3: the domain
+    // layer cannot reach into features, so the lookup is injected here).
+    syncEngine.setDisplayNameResolver(
+      async id => (await getProfile(id)).displayName,
+    );
     if (acc) void backfillInbox();
     // Mirror real network reachability into the connectivity store (offline banner + gating).
     const applyOnline = (connected: boolean): void =>

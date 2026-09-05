@@ -20,6 +20,8 @@ export class AppError extends Error {
   readonly code: string | undefined; // backend error.code
   readonly requestId: string | undefined;
   readonly retryable: boolean;
+  /** `Retry-After` from a 429, in ms. Obeying it is what stops a retry storm from re-earning one. */
+  readonly retryAfterMs: number | undefined;
 
   constructor(
     kind: AppErrorKind,
@@ -29,6 +31,7 @@ export class AppError extends Error {
       code?: string | undefined;
       requestId?: string | undefined;
       retryable?: boolean | undefined;
+      retryAfterMs?: number | undefined;
     } = {},
   ) {
     super(message);
@@ -37,6 +40,7 @@ export class AppError extends Error {
     this.statusCode = opts.statusCode;
     this.code = opts.code;
     this.requestId = opts.requestId;
+    this.retryAfterMs = opts.retryAfterMs;
     this.retryable =
       opts.retryable ??
       (kind === 'network' || kind === 'timeout' || kind === 'server');
@@ -104,10 +108,17 @@ export function normalizeError(error: unknown): AppError {
       typeof body?.message === 'string' && body.message.trim().length > 0
         ? body.message.trim()
         : undefined;
+    // Carry `Retry-After` through so the outbox can wait exactly as long as the server asked
+    // instead of guessing — a retry that lands early just re-earns the 429.
+    const retryAfterRaw = Number(res.headers?.['retry-after']);
+    const retryAfterMs = Number.isFinite(retryAfterRaw)
+      ? Math.max(0, retryAfterRaw) * 1000
+      : undefined;
     return new AppError(kind, serverMsg ?? FRIENDLY[kind], {
       statusCode,
       code,
       requestId,
+      retryAfterMs,
     });
   }
 

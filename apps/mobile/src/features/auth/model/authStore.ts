@@ -11,9 +11,13 @@ import {
   clearDeviceKey,
   getRefreshToken,
   purgeAllLocalChat,
+  clearAllReceipts,
   kv,
   KVKeys,
 } from '../../../infra';
+import { clearProfileCache, clearContactAvatarCache } from '../../user';
+import { clearContactsDiscoveryCache } from '../../contacts';
+import { clearConversationPeerCache } from '../../chat';
 import { logout } from '../api/authApi';
 import type { Tokens } from '../api/authApi';
 
@@ -96,6 +100,17 @@ export const useAuthStore = create<AuthStore>(set => ({
     kv.delete(KVKeys.contactsSnapshot);
     kv.delete(KVKeys.discoverySelfRegistered);
     void purgeAllLocalChat().catch(() => undefined);
+    // Caches keyed by the PREVIOUS account's ids. These live outside the fixed key list — some
+    // are in-memory Maps, some are dynamically-keyed MMKV entries (`rcpt.*.<conversationId>`,
+    // `avatar.<accountId>`) — so no amount of `kv.delete(KVKeys.x)` reaches them, and leaving
+    // them behind hands the next sign-in this account's receipts, avatars and peer mappings.
+    clearAllReceipts();
+    clearProfileCache();
+    clearContactAvatarCache();
+    // Number -> accountId map built by OPRF discovery. Feature-owned, dynamically keyed, and
+    // full of the PREVIOUS account contact graph - it must not survive into the next sign-in.
+    clearContactsDiscoveryCache();
+    clearConversationPeerCache();
     set({ state: 'signed_out', accountId: null, sessionId: null, phone: null });
   },
 

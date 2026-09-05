@@ -86,7 +86,7 @@ export async function checkContactsPermission(): Promise<ContactsAccess> {
 }
 
 /** Prefer a real display name; fall back through the name parts, then company, then number. */
-function pickName(c: RNContact): string {
+function pickName(c: RNContact, fallbackNumber: string): string {
   if (c.displayName && c.displayName.trim()) return c.displayName.trim();
   const full = [c.givenName, c.middleName, c.familyName]
     .filter((p): p is string => Boolean(p && p.trim()))
@@ -94,7 +94,7 @@ function pickName(c: RNContact): string {
     .trim();
   if (full) return full;
   if (c.company && c.company.trim()) return c.company.trim();
-  return c.phoneNumbers[0]?.number ?? '';
+  return fallbackNumber;
 }
 
 /**
@@ -106,13 +106,20 @@ export async function readDeviceContacts(): Promise<DeviceContact[]> {
   const all = await Contacts.getAll();
   const out: DeviceContact[] = [];
   for (const c of all) {
-    const phones = c.phoneNumbers
-      .map(p => p.number)
-      .filter((n): n is string => Boolean(n && n.trim()));
+    // A single malformed record must not take the whole address book down with it. The declared
+    // type says `phoneNumbers` is always an array, but the value crosses the bridge from the
+    // platform's contacts provider — and a throw here surfaces as "native module unavailable",
+    // blanking a screen that had thousands of perfectly good contacts behind it.
+    const numbers = Array.isArray(c?.phoneNumbers) ? c.phoneNumbers : [];
+    const phones: string[] = [];
+    for (const p of numbers) {
+      const n = p?.number;
+      if (typeof n === 'string' && n.trim()) phones.push(n);
+    }
     if (phones.length === 0) continue;
     const dc: DeviceContact = {
       recordId: c.recordID,
-      name: pickName(c),
+      name: pickName(c, phones[0] as string),
       phones,
     };
     if (c.hasThumbnail && c.thumbnailPath) dc.thumbnailPath = c.thumbnailPath;

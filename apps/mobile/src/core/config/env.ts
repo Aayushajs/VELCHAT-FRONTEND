@@ -24,9 +24,9 @@ const name: AppEnvName =
 export const appEnv: AppEnv = {
   name,
   // Fallbacks are only hit in Jest (native module absent) or a misbuilt binary.
-  // Real values come from the flavor's `.env.<flavor>` at build time. `localhost`
-  // works on a USB device / emulator because the `android` script runs
-  // `adb reverse tcp:8080 tcp:8080` (see package.json).
-  apiBaseUrl: Config.API_BASE_URL ?? 'https://velchat-api-gateway.onrender.com',
-  wsUrl: Config.WS_URL ?? 'wss://velchat-realtime-gateway.onrender.com/ws',
+  // Real values come from the flavor's `.env.<flavor>` at build time.
+  // Clients only ever talk to the EDGE GATEWAY — one base URL per environment, never a
+  // per-service host (D:\Velchat\docs\RUNBOOK.md §0b). Production is the safe fallback.
+  apiBaseUrl: Config.API_BASE_URL ?? 'https://velchat.duckdns.org',
+  wsUrl: Config.WS_URL ?? 'wss://velchat.duckdns.org/ws',
 };

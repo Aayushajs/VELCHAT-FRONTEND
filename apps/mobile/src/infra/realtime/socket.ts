@@ -21,6 +21,14 @@ import { log } from '../../core';
 const PING_INTERVAL_MS = 25_000;
 /** Watchdog: no inbound frame within this window ⇒ the link is dead → close + report. */
 const DEAD_AFTER_MS = 60_000;
+/**
+ * Handshake deadline. A WebSocket that never leaves CONNECTING never fires `onopen` OR
+ * `onclose` — a captive portal or a stalled TCP handshake can hold it there for as long as
+ * the OS allows (minutes, or forever on some carriers). The engine is single-flight and only
+ * re-arms on a REPORTED close, so an unbounded handshake is not a slow connect: it is a
+ * permanently dead realtime link that still renders as "connecting". Bound it here.
+ */
+const CONNECT_TIMEOUT_MS = 15_000;
 /** App-defined close code for a watchdog-detected dead link (distinct from server codes). */
 export const WS_CODE_DEAD = 4000;
 /** Server close code when the connection is missing account_id/device_id (do NOT retry). */
@@ -78,6 +86,7 @@ export class RealtimeSocket {
   private ws: AppWebSocket | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRxAt = 0;
   /** Guards against a double onClose report (intentional close detaches handlers). */
   private reported = false;
@@ -109,7 +118,16 @@ export class RealtimeSocket {
       return;
     }
     this.ws = ws;
+    // Arm the handshake deadline BEFORE any callback can fire: a socket stuck in CONNECTING
+    // is reported as a close so the engine's backoff (not this transport) drives the retry.
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = null;
+      log.warn('ws connect timeout — handshake never completed');
+      this.teardown();
+      this.report(WS_CODE_DEAD, 'connect-timeout');
+    }, CONNECT_TIMEOUT_MS);
     ws.onopen = () => {
+      this.clearConnectTimer();
       this.lastRxAt = Date.now();
       this.startTimers();
       this.cb.onOpen?.();
@@ -233,7 +251,15 @@ export class RealtimeSocket {
     }, PING_INTERVAL_MS);
   }
 
+  private clearConnectTimer(): void {
+    if (this.connectTimer !== null) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+  }
+
   private stopTimers(): void {
+    this.clearConnectTimer();
     if (this.pingTimer !== null) {
       clearInterval(this.pingTimer);
       this.pingTimer = null;

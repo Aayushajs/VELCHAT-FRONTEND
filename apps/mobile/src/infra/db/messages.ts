@@ -22,20 +22,69 @@ const MESSAGE_WINDOW = 50;
  * reactions/attachments are intentionally NOT observed (the bubble doesn't render them yet)
  * so a receipt burst can't trigger an O(n) re-query for columns nothing draws.
  */
-export function observeMessages(conversationId: string) {
+export function observeMessages(
+  conversationId: string,
+  limit: number = MESSAGE_WINDOW,
+) {
   return getDatabase()
     .get<Message>('messages')
     .query(
       Q.where('conversation_id', conversationId),
       Q.where('deleted', false),
       Q.sortBy('created_at', Q.desc),
-      Q.take(MESSAGE_WINDOW),
+      Q.take(Math.max(1, limit)),
     )
     .observeWithColumns(['state']);
 }
 
+/** How many more messages a "load older" step reveals. */
+export const MESSAGE_PAGE = MESSAGE_WINDOW;
+
+/** Total messages held locally for a conversation — tells the UI whether older ones exist. */
+export function countMessages(conversationId: string): Promise<number> {
+  return getDatabase()
+    .get<Message>('messages')
+    .query(
+      Q.where('conversation_id', conversationId),
+      Q.where('deleted', false),
+    )
+    .fetchCount();
+}
+
+/** Lowest seq we hold — the cursor a fetch of OLDER history has to reach back before. */
+export async function minSeqForConversation(
+  conversationId: string,
+): Promise<number> {
+  const rows = await getDatabase()
+    .get<Message>('messages')
+    .query(
+      Q.where('conversation_id', conversationId),
+      Q.where('seq', Q.gt(0)),
+      Q.sortBy('seq', Q.asc),
+      Q.take(1),
+    )
+    .fetch();
+  return rows[0]?.seq ?? 0;
+}
+
+/**
+ * A strictly increasing local timestamp.
+ *
+ * `Date.now()` is not unique: two messages composed in the same millisecond — "omw" then
+ * "5 min", one thought in two bubbles — share a stamp. Both the outbox's head-of-line rule and
+ * the list's sort key are that stamp, so with a tie the transmit order (and therefore the seq
+ * order the peer sees) came down to SQLite's fetch order. Nudging each collision forward by a
+ * millisecond makes the ordering deterministic by construction instead of by luck.
+ */
+export function nextLocalStamp(): number {
+  const now = Date.now();
+  lastStamp = now > lastStamp ? now : lastStamp + 1;
+  return lastStamp;
+}
+let lastStamp = 0;
+
 /** A short client message id (server seq is assigned later, on ACK). */
-function newClientMsgId(): string {
+export function newClientMsgId(): string {
   return `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
@@ -54,7 +103,7 @@ export async function sendMessageLocal(
   const body = text.trim();
   if (!body) return null;
   const db = getDatabase();
-  const now = Date.now();
+  const now = nextLocalStamp();
   const clientMsgId = newClientMsgId();
   await db.write(async () => {
     await db.get<Message>('messages').create(m => {
@@ -140,19 +189,49 @@ export async function applyServerMessages(
   const convs = db.get<Conversation>('conversations');
   const now = Date.now();
   const sorted = [...servers].sort((a, b) => a.seq - b.seq);
+  // Look the whole batch up in TWO queries instead of two per row. The per-row version ran 2N
+  // serialised SQLite reads INSIDE the write transaction, holding the writer lock the entire
+  // time — so a 100-row backfill blocked every other write behind it, including the optimistic
+  // send, and the composer visibly froze the moment a catch-up landed.
+  const clientIds = sorted
+    .map(s => s.clientMsgId)
+    .filter((id): id is string => typeof id === 'string' && id.length > 0);
+  const seqs = sorted.map(s => s.seq);
+  const convIds = [...new Set(sorted.map(s => s.conversationId))];
+
+  const [existingByClient, existingBySeq] = await Promise.all([
+    clientIds.length > 0
+      ? msgs.query(Q.where('client_msg_id', Q.oneOf(clientIds))).fetch()
+      : Promise.resolve([] as Message[]),
+    msgs
+      .query(
+        Q.where('conversation_id', Q.oneOf(convIds)),
+        Q.where('seq', Q.oneOf(seqs)),
+      )
+      .fetch(),
+  ]);
+
+  const byClientId = new Map<string, Message>();
+  for (const row of existingByClient) {
+    if (row.clientMsgId) byClientId.set(row.clientMsgId, row);
+  }
+  const bySeqKey = new Map<string, Message[]>();
+  for (const row of existingBySeq) {
+    const key = `${row.conversationId}#${String(row.seq)}`;
+    const list = bySeqKey.get(key);
+    if (list) list.push(row);
+    else bySeqKey.set(key, [row]);
+  }
+
   await db.write(async () => {
     const ops: Model[] = [];
     const bumps = new Map<string, ConvBump>();
     for (const s of sorted) {
-      const byClient = s.clientMsgId
-        ? await msgs.query(Q.where('client_msg_id', s.clientMsgId)).fetch()
-        : [];
-      const bySeq = await msgs
-        .query(
-          Q.where('conversation_id', s.conversationId),
-          Q.where('seq', s.seq),
-        )
-        .fetch();
+      const clientRow = s.clientMsgId
+        ? byClientId.get(s.clientMsgId)
+        : undefined;
+      const byClient = clientRow ? [clientRow] : [];
+      const bySeq = bySeqKey.get(`${s.conversationId}#${String(s.seq)}`) ?? [];
       const decision = reconcileDecision({
         hasClientMsgIdRow: byClient.length > 0,
         hasSeqRow: bySeq.length > 0,
@@ -283,7 +362,16 @@ export async function markMessageSent(
     ops.push(
       row.prepareUpdate(m => {
         m.seq = ack.seq;
-        if (ack.serverTs !== undefined) m.serverTs = ack.serverTs;
+        if (ack.serverTs !== undefined) {
+          m.serverTs = ack.serverTs;
+          // Re-stamp the ordering key to the SERVER clock. The list is ordered by `created_at`,
+          // which was stamped when the user hit send — fine online, hours stale for a message
+          // composed offline. Left alone it stays pinned at its compose time, buried under
+          // everything that arrived while there was no signal (and, past a window's worth,
+          // outside the loaded window entirely), which reads as "my message disappeared".
+          // Never move it backwards: a skewed server clock must not re-bury it.
+          if (ack.serverTs > m.createdAt) m.createdAt = ack.serverTs;
+        }
         if (m.state === 'sending' || m.state === 'failed') m.state = 'sent';
       }),
     );
@@ -298,7 +386,15 @@ export async function markMessageSent(
   });
 }
 
-/** Surface a permanently-failed send in the UI (retry affordance) — state → `failed`. */
+/**
+ * Surface a permanently-failed send in the UI (retry affordance) — state → `failed`.
+ *
+ * Guarded the same way `markMessageSent` and the inbound reconcile are: only a message still
+ * in flight may fail. Sends are idempotent server-side, so a row can be acknowledged (even read
+ * by the peer) while its outbox row survives a mid-ack crash and gets re-driven; without this
+ * guard a later transport failure would flip a message the recipient has ALREADY READ into a red
+ * "failed — tap to retry" bubble. Receipt state only ever moves forward.
+ */
 export async function markMessageFailed(clientMsgId: string): Promise<void> {
   const db = getDatabase();
   const msgs = db.get<Message>('messages');
@@ -308,6 +404,7 @@ export async function markMessageFailed(clientMsgId: string): Promise<void> {
       .fetch();
     const row = mine[0];
     if (!row) return;
+    if (row.state !== 'sending' && row.state !== 'failed') return;
     await row.update(m => {
       m.state = 'failed';
     });
@@ -359,15 +456,6 @@ export async function applyReceipt(
   const meId = getAccountId();
   if (meId === undefined) return;
   const db = getDatabase();
-  const rows = await db
-    .get<Message>('messages')
-    .query(
-      Q.where('conversation_id', conversationId),
-      Q.where('sender_id', meId),
-      Q.where('seq', Q.gt(0)),
-      Q.where('seq', Q.lte(upToSeq)),
-    )
-    .fetch();
   const rank: Record<string, number> = {
     sending: 0,
     sent: 1,
@@ -375,7 +463,22 @@ export async function applyReceipt(
     read: 3,
   };
   const target = rank[state] ?? 0;
-  const toUpdate = rows.filter(r => (rank[r.state] ?? 0) < target);
+  // Only states BELOW the target can move. Receipts are cumulative, so `upToSeq` marches toward
+  // the conversation maximum — without this predicate a chatty peer's every receipt materialised
+  // every message we had ever sent in that conversation (tens of thousands of model instances in
+  // a long DM) just to find the one or two rows that actually needed updating.
+  const behind = Object.keys(rank).filter(k => (rank[k] ?? 0) < target);
+  if (behind.length === 0) return;
+  const toUpdate = await db
+    .get<Message>('messages')
+    .query(
+      Q.where('conversation_id', conversationId),
+      Q.where('sender_id', meId),
+      Q.where('seq', Q.gt(0)),
+      Q.where('seq', Q.lte(upToSeq)),
+      Q.where('state', Q.oneOf(behind)),
+    )
+    .fetch();
   if (toUpdate.length === 0) return;
   await db.write(async () => {
     await db.batch(

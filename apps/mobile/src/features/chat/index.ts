@@ -8,5 +8,7 @@ export { ChatsList } from './ui/ChatsList';
 export { ChatScreen } from './ui/ChatScreen';
 export { NewChatScreen } from './ui/NewChatScreen';
 export { useConversations } from './hooks/useConversations';
+export type { ConversationRowVM } from './hooks/useConversations';
+export { clearConversationPeerCache } from './hooks/useConversationPeer';
 export { useStartDm } from './hooks/useStartDm';
 export { backfillInbox } from './api/backfillInbox';

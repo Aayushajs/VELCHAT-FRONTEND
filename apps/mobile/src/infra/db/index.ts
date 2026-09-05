@@ -11,9 +11,12 @@ export {
   listConversationIds,
   clearUnread,
   upsertConversation,
+  peerIdentityAgeMs,
+  peerIdFor,
+  observeConversation,
   purgeAllLocalChat,
 } from './queries';
-export type { ConversationPatch } from './queries';
+export type { ConversationPatch, RowStream } from './queries';
 export {
   observeMessages,
   sendMessageLocal,
@@ -23,10 +26,14 @@ export {
   markMessageFailed,
   markMessageSending,
   maxSeqForConversation,
+  minSeqForConversation,
+  countMessages,
+  MESSAGE_PAGE,
   applyReceipt,
 } from './messages';
 export {
   enqueueSend,
+  enqueueOptimisticSend,
   claimNextDue,
   markAckd,
   markFailed,
@@ -35,6 +42,10 @@ export {
   outboxStats,
 } from './outbox';
 export type { OutboxItem, OutboxStats } from './outbox';
+export { classifySendFailure } from './sendFailurePolicy';
+export { shouldProbeGap } from './gapDetection';
+export type { GapProbeInput } from './gapDetection';
+export type { SendFailureDecision } from './sendFailurePolicy';
 export {
   reconcileDecision,
   backoffMs,
@@ -49,6 +60,28 @@ export {
   sanitizeLikeQuery,
 } from './search';
 export type { ConversationSearchHit, MessageSearchHit } from './search';
+export {
+  pendingReceiptFrames,
+  mergeWatermark,
+  EMPTY_WATERMARKS,
+} from './receiptLedger';
+export type {
+  ReceiptWatermarks,
+  ReceiptState,
+  ReceiptFrame,
+} from './receiptLedger';
+export {
+  getDesired,
+  getSent,
+  noteDesired,
+  noteSent,
+  getPeerWatermark,
+  notePeerWatermark,
+  markDirty,
+  takeDirty,
+  hasDirty,
+  clearAllReceipts,
+} from './receiptStore';
 export {
   Conversation,
   Message,

@@ -32,3 +32,12 @@ export type {
   PresenceEntry,
   TypingEntry,
 } from './realtimeStore';
+export {
+  recordLatency,
+  timed,
+  latencyStats,
+  allLatencyStats,
+  logLatencySnapshot,
+  resetLatency,
+} from './perf/latency';
+export type { LatencySpan, LatencyStats } from './perf/latency';

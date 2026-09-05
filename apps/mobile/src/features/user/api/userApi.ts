@@ -11,21 +11,50 @@ export type { Profile };
 // Short-lived profile cache + in-flight dedup. The New-Chat DP fetches + inbox backfill + startDm
 // all resolve the same peer profiles; without this they'd fire many duplicate GET /profile calls
 // (and trip the edge rate limit → 429). Keyed by userId, 5-min TTL, in-memory (session).
+// BOUNDED (§M0 rule 7): a TTL alone never removes anything, so a long session browsing the
+// directory grew this map without limit. Profiles are also another account's data — logout
+// must call `clearProfileCache()`.
 const PROFILE_TTL_MS = 5 * 60_000;
+const PROFILE_CACHE_CAP = 200;
 const profileCache = new Map<string, { at: number; profile: Profile }>();
 const profileInFlight = new Map<string, Promise<Profile>>();
 
+// In-flight requests started before a logout must not repopulate a cleared cache.
+let generation = 0;
+
+/** Insert as most-recently-used (Map keeps insertion order) and evict the oldest over cap. */
+function cacheProfile(userId: string, profile: Profile): void {
+  profileCache.delete(userId);
+  profileCache.set(userId, { at: Date.now(), profile });
+  while (profileCache.size > PROFILE_CACHE_CAP) {
+    const oldest: string | undefined = profileCache.keys().next().value;
+    if (oldest === undefined) break;
+    profileCache.delete(oldest);
+  }
+}
+
+/** Drop every cached profile. MUST be called on logout — these belong to that account. */
+export function clearProfileCache(): void {
+  generation += 1;
+  profileCache.clear();
+  profileInFlight.clear();
+}
+
 export async function getProfile(userId: string): Promise<Profile> {
   const cached = profileCache.get(userId);
-  if (cached && Date.now() - cached.at < PROFILE_TTL_MS) return cached.profile;
+  if (cached) {
+    if (Date.now() - cached.at < PROFILE_TTL_MS) return cached.profile;
+    profileCache.delete(userId); // expired: drop it rather than let it sit forever
+  }
   const inFlight = profileInFlight.get(userId);
   if (inFlight) return inFlight;
 
+  const gen = generation;
   const p = api
     .get(`/users/${userId}/profile`)
     .then(res => {
       const profile = normalizeProfile(res.data);
-      profileCache.set(userId, { at: Date.now(), profile });
+      if (gen === generation) cacheProfile(userId, profile);
       return profile;
     })
     .finally(() => profileInFlight.delete(userId));
@@ -51,7 +80,7 @@ export async function updateProfile(
 ): Promise<Profile> {
   const res = await api.put(`/users/${userId}/profile`, patch);
   const profile = normalizeProfile(res.data);
-  profileCache.set(userId, { at: Date.now(), profile }); // keep the cache fresh, don't serve stale
+  cacheProfile(userId, profile); // keep the cache fresh, don't serve stale
   return profile;
 }
 

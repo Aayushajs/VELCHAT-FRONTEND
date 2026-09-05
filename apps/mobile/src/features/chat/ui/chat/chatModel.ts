@@ -58,6 +58,21 @@ export function startsNewRun(
   return older.senderId !== cur.senderId;
 }
 
+/**
+ * Time-of-day token (12-hour, e.g. "9:05 AM") — the bubble timestamp and the header's
+ * presence line share it. `toLocaleTimeString` is ICU over JNI on Hermes, so callers must
+ * resolve this ONCE per DB emission, never per row per render (§R4). '' for an invalid ts.
+ */
+export function compactTime(ts: number): string {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+}
+
 export type DayCategory = 'today' | 'yesterday' | 'other';
 
 /** Classify `ts` relative to `now` for the date-separator label (DST-safe). */
@@ -83,13 +98,7 @@ export function presenceTimeLabel(
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return '';
   const cat = dayCategory(ts, now);
-  if (cat === 'today') {
-    return d.toLocaleTimeString(undefined, {
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-    });
-  }
+  if (cat === 'today') return compactTime(ts);
   if (cat === 'yesterday') return yesterdayLabel;
   return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
 }
