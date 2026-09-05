@@ -1,6 +1,6 @@
 {
   "name": "@velchat/mobile",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "private": true,
   "scripts": {
     "android": "adb reverse tcp:8080 tcp:8080 && react-native run-android --mode devDebug --appIdSuffix dev",

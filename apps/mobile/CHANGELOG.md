@@ -1,5 +1,11 @@
 # @velchat/mobile
 
+## 1.0.0
+
+### Major Changes
+
+- 1e89077: change more fetures and fix bug
+
 ## 0.5.0
 
 ### Minor Changes
