@@ -67,6 +67,22 @@ export async function minSeqForConversation(
   return rows[0]?.seq ?? 0;
 }
 
+/**
+ * A strictly increasing local timestamp.
+ *
+ * `Date.now()` is not unique: two messages composed in the same millisecond — "omw" then
+ * "5 min", one thought in two bubbles — share a stamp. Both the outbox's head-of-line rule and
+ * the list's sort key are that stamp, so with a tie the transmit order (and therefore the seq
+ * order the peer sees) came down to SQLite's fetch order. Nudging each collision forward by a
+ * millisecond makes the ordering deterministic by construction instead of by luck.
+ */
+export function nextLocalStamp(): number {
+  const now = Date.now();
+  lastStamp = now > lastStamp ? now : lastStamp + 1;
+  return lastStamp;
+}
+let lastStamp = 0;
+
 /** A short client message id (server seq is assigned later, on ACK). */
 export function newClientMsgId(): string {
   return `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -87,7 +103,7 @@ export async function sendMessageLocal(
   const body = text.trim();
   if (!body) return null;
   const db = getDatabase();
-  const now = Date.now();
+  const now = nextLocalStamp();
   const clientMsgId = newClientMsgId();
   await db.write(async () => {
     await db.get<Message>('messages').create(m => {

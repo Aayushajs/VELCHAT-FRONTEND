@@ -12,7 +12,7 @@
 import { Q } from '@nozbe/watermelondb';
 import { getDatabase } from './database';
 import { Outbox, Message, Conversation } from './models';
-import { newClientMsgId } from './messages';
+import { newClientMsgId, nextLocalStamp } from './messages';
 import { backoffMs, nextOutboxRetry } from './syncLogic';
 import type { SendMessageInput } from '../network/chat';
 
@@ -114,6 +114,12 @@ export function enqueueOptimisticSend(
 
   return withOutboxLock(async () => {
     const db = getDatabase();
+    // Two stamps, deliberately. `order` is monotonic because it is BOTH the outbox head-of-line
+    // key and the list's sort key: two sends in the same millisecond would otherwise tie and
+    // transmit in an arbitrary order, so the peer reads the reply before the message. `now` stays
+    // wall-clock because it is a DUE time — a nudged-forward stamp would make the row briefly
+    // un-claimable by its own scheduler.
+    const order = nextLocalStamp();
     const now = Date.now();
     const clientMsgId = newClientMsgId();
     const payload: SendMessageInput = {
@@ -136,7 +142,7 @@ export function enqueueOptimisticSend(
         m.deleted = false;
         m.viewOnce = false;
         m.starred = false;
-        m.createdAt = now;
+        m.createdAt = order;
       });
       await db.get<Outbox>('outbox').create(o => {
         o.kind = KIND_SEND;
@@ -145,7 +151,7 @@ export function enqueueOptimisticSend(
         o.state = 'queued';
         o.attempts = 0;
         o.nextAttemptAt = now;
-        o.createdAt = now;
+        o.createdAt = order;
         o.updatedAt = now;
       });
       // The conversation row may not exist locally yet (conversations are owned server-side) —
@@ -157,7 +163,7 @@ export function enqueueOptimisticSend(
       if (conv) {
         await conv.update(c => {
           c.lastMessagePreview = body;
-          c.lastMessageAt = now;
+          c.lastMessageAt = order;
           c.unreadCount = 0;
           c.updatedAt = now;
         });

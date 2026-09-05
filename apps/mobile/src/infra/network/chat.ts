@@ -136,7 +136,7 @@ function pickContent(d: Record<string, unknown>): string | undefined {
 /** Normalise a SendAck; `seq` is required, missing/NaN → 0 (never a silent undefined key). */
 export function normalizeSendAck(raw: unknown): SendAck {
   const d = rec(raw);
-  const messageId = pickStr(d, 'messageId', 'message_id', 'id') ?? '';
+  const messageId = pickStr(d, 'messageId', 'message_id', '_id', 'id') ?? '';
   const seq = pickNum(d, 'seq') ?? 0;
   const serverTs = pickTimestamp(
     d,
@@ -159,7 +159,7 @@ export function normalizeServerMessage(raw: unknown): ServerMessage | null {
   const conversationId = pickStr(d, 'conversationId', 'conversation_id');
   if (seq === undefined || conversationId === undefined) return null;
   const messageId =
-    pickStr(d, 'messageId', 'message_id', 'id') ??
+    pickStr(d, 'messageId', 'message_id', '_id', 'id') ??
     `srv_${conversationId}_${seq}`;
   const senderId =
     pickStr(
