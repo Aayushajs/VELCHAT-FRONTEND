@@ -84,6 +84,7 @@ export {
   markDirty,
   takeDirty,
   hasDirty,
+  reassertReceipts,
   clearAllReceipts,
 } from './receiptStore';
 export {

@@ -76,6 +76,7 @@ import {
   notePeerWatermark,
   markDirty,
   takeDirty,
+  reassertReceipts,
 } from '../../infra';
 
 /** Lower/upper bounds for the outbox self-adjusting timer (never poll a hot loop). */
@@ -442,6 +443,11 @@ class SyncEngine {
         log.info('ws open');
       },
       onConnected: () => {
+        // A frame we handed to a dead or misbehaving link was recorded as sent even though the
+        // peer never saw it — which is how a tick gets stuck on one tick permanently, since the
+        // only client that could correct it believes the work is done. A reconnect is exactly when
+        // that belief is worthless, so re-announce what we want the peer to know.
+        for (const id of reassertReceipts()) markDirty(id);
         // Re-emit anything the peer still doesn't know BEFORE the catch-up: receipts owed from
         // before the drop are the ones most likely to be showing a stale tick right now.
         this.flushReceipts();

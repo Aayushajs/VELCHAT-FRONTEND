@@ -114,6 +114,7 @@ export {
   markDirty,
   takeDirty,
   hasDirty,
+  reassertReceipts,
   clearAllReceipts,
 } from './db';
 export type {
