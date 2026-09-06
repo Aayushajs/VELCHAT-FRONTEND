@@ -955,6 +955,13 @@ class SyncEngine {
           const ack = await sendChatMessage(item.input);
           await markMessageSent(item.clientMsgId, ack);
           await markAckd(item.id);
+          // The peer may have acknowledged this message BEFORE our own ack came back — the
+          // fan-out reaches them while our HTTP response is still in flight, so their `delivered`
+          // routinely wins the race. Applied then it matched nothing, because the row had no seq
+          // yet and `applyReceipt` selects on seq. Now that it has one, re-apply what the peer
+          // already told us; without this the message keeps a single tick for good, however long
+          // ago it was delivered.
+          await this.applyPeerWatermark(item.conversationId);
           // From when the user composed it, not from when this attempt started: a message that
           // sat in the queue through three failures took that long to be delivered, and pretending
           // otherwise would make a bad network look fast.
