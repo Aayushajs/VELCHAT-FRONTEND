@@ -99,3 +99,43 @@ describe('parseReceiptFrame', () => {
     expect(parseReceiptFrame(frame, ME)).toBeNull();
   });
 });
+
+/**
+ * A chat with yourself is the one case where a receipt from "me" is not an echo to discard.
+ *
+ * The self-echo filter exists because the gateway fans every receipt to every member INCLUDING
+ * the acknowledger: without it, opening a chat would turn your OWN bubbles blue and the ticks
+ * would describe you instead of the peer. In "Message yourself" you ARE the other member, so
+ * that same rule silently suppresses the only receipt that will ever arrive — the ticks can
+ * never advance past sent, no matter how obviously the message was delivered and read.
+ */
+describe('parseReceiptFrame — a conversation with only me', () => {
+  const frame = (me: string) => ({
+    conversation_id: 'dm-self',
+    up_to_seq: 7,
+    user_id: me,
+    state: 'read',
+  });
+
+  it('still discards my echo in a conversation that has a peer', () => {
+    expect(
+      parseReceiptFrame(frame('me'), 'me', { selfChat: false }),
+    ).toBeNull();
+  });
+
+  it('accepts my own receipt when I am the only member', () => {
+    const r = parseReceiptFrame(frame('me'), 'me', { selfChat: true });
+    expect(r).toEqual({ conversationId: 'dm-self', upToSeq: 7, state: 'read' });
+  });
+
+  it('defaults to discarding it, so the common case needs no opt-out', () => {
+    expect(parseReceiptFrame(frame('me'), 'me')).toBeNull();
+  });
+
+  it('keeps a peer receipt in a self chat too — a stray frame is still applied on merit', () => {
+    const r = parseReceiptFrame({ ...frame('me'), user_id: 'someone' }, 'me', {
+      selfChat: true,
+    });
+    expect(r?.state).toBe('read');
+  });
+});

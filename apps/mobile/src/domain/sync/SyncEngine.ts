@@ -903,7 +903,16 @@ class SyncEngine {
     // gateway fans a receipt to EVERY member including the acknowledger, so without that
     // filter our own `read` — emitted the instant we open a chat — came back and turned our
     // OWN bubbles blue, making the ticks describe us rather than the peer.
-    const r = parseReceiptFrame(data, getAccountId());
+    // Parse WITHOUT the self-echo rule first, so we know which conversation this is about, then
+    // apply the rule with that context: in a chat whose only member is us, our own receipt is the
+    // only one that will ever arrive and must NOT be discarded.
+    const me = getAccountId();
+    const preview = parseReceiptFrame(data, undefined);
+    if (!preview) return;
+    const selfChat =
+      me !== undefined &&
+      (await peerIdFor(preview.conversationId).catch(() => undefined)) === me;
+    const r = parseReceiptFrame(data, me, { selfChat });
     if (!r) return;
     const { conversationId, upToSeq, state } = r;
     // Remember it even if it matches nothing right now: a receipt for messages we have not

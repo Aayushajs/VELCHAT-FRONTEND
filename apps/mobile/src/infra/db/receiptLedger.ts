@@ -121,6 +121,7 @@ function frameString(
 export function parseReceiptFrame(
   data: unknown,
   meId: string | undefined,
+  opts: { selfChat?: boolean } = {},
 ): InboundReceipt | null {
   if (!data || typeof data !== 'object') return null;
   const d = data as Record<string, unknown>;
@@ -142,8 +143,13 @@ export function parseReceiptFrame(
   if (!Number.isFinite(upToSeq) || upToSeq <= 0) return null;
 
   // Our own acknowledgement, fanned back to us — never apply it to our own bubbles.
+  //
+  // Except in a conversation whose only member IS us ("Message yourself"), where our own receipt
+  // is the only one that will ever arrive. Discarding it there leaves those ticks stuck on `sent`
+  // forever, however plainly the message was delivered and read.
   const actor = frameString(d, 'user_id', 'userId') ?? d.account_id;
   if (
+    !opts.selfChat &&
     meId !== undefined &&
     typeof actor === 'string' &&
     actor !== '' &&
