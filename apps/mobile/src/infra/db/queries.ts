@@ -69,7 +69,14 @@ export function observeConversations(limit?: number) {
 export async function listConversationIds(): Promise<string[]> {
   const rows = await getDatabase()
     .get<Conversation>('conversations')
-    .query()
+    .query(
+      // Most recent first: reconnect catches up in this order, so the first conversations to
+      // become current are the ones the user is most likely to open. In storage order the first
+      // thing caught up is arbitrary, and the "Syncing your messages…" banner ends up describing
+      // work nobody is waiting on. Conversations with no activity sort last (0) but are still
+      // visited — a missed first message would be sitting in exactly one of those.
+      Q.sortBy('last_message_at', Q.desc),
+    )
     .fetch();
   return rows.map(c => c.id);
 }
@@ -132,6 +139,22 @@ export async function peerIdentityAgeMs(
     .catch(() => null);
   const at = row?.peerAvatarAt;
   return at === undefined || at === null ? null : Date.now() - at;
+}
+
+/**
+ * Conversations whose peer is this account — the rows whose cached name/photo a profile change
+ * makes stale. Used to push a change into the chat list immediately instead of waiting out the
+ * revalidation TTL.
+ */
+export async function conversationIdsForPeer(
+  accountId: string,
+): Promise<string[]> {
+  if (!accountId) return [];
+  const rows = await getDatabase()
+    .get<Conversation>('conversations')
+    .query(Q.where('peer_id', accountId))
+    .fetch();
+  return rows.map(r => r.id);
 }
 
 /**

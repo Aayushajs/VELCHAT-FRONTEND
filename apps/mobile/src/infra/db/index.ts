@@ -12,6 +12,7 @@ export {
   clearUnread,
   upsertConversation,
   peerIdentityAgeMs,
+  conversationIdsForPeer,
   peerIdFor,
   observeConversation,
   purgeAllLocalChat,

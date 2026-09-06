@@ -26,6 +26,7 @@ import {
   getMediaUrl,
   type Profile,
 } from '../api/userApi';
+import { publishProfileChanged } from '../../../core';
 
 // Re-exported so feature UI gets haptics through the feature layer (UI must not
 // import infra directly — layer boundaries §M3).
@@ -266,6 +267,11 @@ export function useSaveProfile(): {
       setError(null);
       try {
         await updateProfile(accountId, patch);
+        // Tell every cache holding this account's profile that it just moved. Without this the
+        // new photo is on the server and in the local mirror, while the chat list, chat headers
+        // and contact rows keep serving the copy they resolved earlier — until each TTL expires
+        // or the app is killed. That is the whole "it only changes after I reopen the app" bug.
+        publishProfileChanged(accountId);
         // Mirror name/about locally so Settings + Profile render instantly (no fetch).
         if (patch.displayName) kv.set(KVKeys.displayName, patch.displayName);
         if (patch.about !== undefined) kv.set(KVKeys.about, patch.about);

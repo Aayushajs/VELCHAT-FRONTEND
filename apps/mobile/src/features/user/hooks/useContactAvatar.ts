@@ -24,6 +24,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Image } from 'react-native';
 import { kv } from '../../../infra';
 import { getProfile, getMediaUrl } from '../api/userApi';
+import { subscribeProfileChanged } from '../../../core';
 
 const URL_TTL_MS = 9 * 60_000; // refresh just before the ~10-min signed-URL expiry
 const MEM_CAP = 200; // live URLs held in RAM — far more than any visible window
@@ -122,6 +123,44 @@ export function clearContactAvatarCache(): void {
   }
 }
 
+/**
+ * Mounted instances, so an invalidation can refresh what is ALREADY on screen.
+ *
+ * Clearing the caches alone is not enough: this hook returns from the render cache, so a row that
+ * is already displaying the old photo would keep displaying it until something else happened to
+ * re-render it. That is the difference between "the cache is correct now" and "the user can see
+ * the new photo now".
+ */
+const mounted = new Map<string, Set<() => void>>();
+
+function watch(accountId: string, refresh: () => void): () => void {
+  const set = mounted.get(accountId) ?? new Set<() => void>();
+  set.add(refresh);
+  mounted.set(accountId, set);
+  return () => {
+    set.delete(refresh);
+    if (set.size === 0) mounted.delete(accountId);
+  };
+}
+
+/**
+ * Forget one account's resolved photo, in RAM and on disk, and re-resolve it wherever it is
+ * currently rendered. Driven by the profile-change bus, so a photo change — ours or a peer's —
+ * lands everywhere at once instead of waiting out a TTL.
+ */
+export function invalidateContactAvatar(accountId: string): void {
+  if (!accountId) return;
+  mem.delete(accountId);
+  try {
+    kv.delete(cacheKey(accountId));
+  } catch {
+    // best-effort: the RAM drop above is what the next render actually reads
+  }
+  for (const refresh of [...(mounted.get(accountId) ?? [])]) refresh();
+}
+
+subscribeProfileChanged(invalidateContactAvatar);
+
 export function useContactAvatar(
   accountId: string | undefined,
 ): string | undefined {
@@ -135,6 +174,11 @@ export function useContactAvatar(
     if (!accountId) return undefined;
     let alive = true;
     const gen = generation;
+    // Re-read on invalidation. `rendered` still holds the OLD url, so `settle()` sees a real
+    // difference and re-renders; a missing cache entry then drives the refresh below.
+    const unwatch = watch(accountId, () => {
+      if (alive && gen === generation) bump(n => (n + 1) % 1_000_000);
+    });
     const settle = (): void => {
       if (!alive || gen !== generation) return;
       const next = mem.get(accountId);
@@ -159,6 +203,7 @@ export function useContactAvatar(
     if (fresh) {
       return () => {
         alive = false;
+        unwatch();
       };
     }
 
@@ -182,6 +227,7 @@ export function useContactAvatar(
     })();
     return () => {
       alive = false;
+      unwatch();
     };
   }, [accountId]);
 

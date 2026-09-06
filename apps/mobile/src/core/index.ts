@@ -43,3 +43,7 @@ export {
 } from './perf/latency';
 export type { LatencySpan, LatencyStats } from './perf/latency';
 export type { BannerKind, BannerInput } from './connectionBanner';
+export {
+  publishProfileChanged,
+  subscribeProfileChanged,
+} from './profileEvents';

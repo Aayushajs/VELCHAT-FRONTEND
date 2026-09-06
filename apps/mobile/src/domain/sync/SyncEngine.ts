@@ -98,6 +98,13 @@ const RECEIPT_FLUSH_DELAY_MS = 250;
  * "syncing" for minutes; unbounded fan-out is a self-inflicted burst against the edge limiter.
  */
 const RESYNC_CONCURRENCY = 4;
+/**
+ * Conversations whose catch-up the user actually waits on. `syncing` should describe the chat in
+ * front of them, not a walk of their entire history: with a few hundred conversations the banner
+ * otherwise sits there through hundreds of round-trips while the app is already perfectly usable.
+ * The rest continue quietly afterwards — the same work, just not presented as a wait.
+ */
+const PRIORITY_SYNC_COUNT = 8;
 /** Matches the server's hard clamp — a full page means "there is more", so keep paging. */
 const BACKFILL_PAGE = 100;
 /** Safety stop for the paging loop: 100 pages = 10k messages in one conversation, per resync. */
@@ -629,6 +636,31 @@ class SyncEngine {
       ids = [active, ...ids.filter(id => id !== active)];
     }
 
+    // The conversation on screen plus the most recent handful — everything a user could be
+    // looking at right now. `ids` is already most-recent-first.
+    const priority = ids.slice(0, PRIORITY_SYNC_COUNT);
+    const rest = ids.slice(PRIORITY_SYNC_COUNT);
+
+    await this.backfillMany(priority);
+    // Receipts owed for what just landed, then report live: the app IS current for everything the
+    // user can see. Holding `syncing` until the whole history is walked describes work nobody is
+    // waiting on and reads as a hang.
+    this.flushReceipts();
+    if (!this.stopped && this.socket) this.setConnState('live');
+
+    if (rest.length > 0) {
+      // Deliberately not awaited: the remainder converges in the background.
+      void this.backfillMany(rest)
+        .then(() => {
+          this.flushReceipts();
+        })
+        .catch(() => undefined);
+    }
+  }
+
+  /** Backfill a set of conversations with bounded concurrency. */
+  private async backfillMany(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
     let next = 0;
     const worker = async (): Promise<void> => {
       for (;;) {
@@ -647,10 +679,6 @@ class SyncEngine {
     await Promise.all(
       Array.from({ length: Math.min(RESYNC_CONCURRENCY, ids.length) }, worker),
     );
-
-    // Anything the catch-up marked delivered goes out as one cumulative frame per conversation.
-    this.flushReceipts();
-    if (!this.stopped && this.socket) this.setConnState('live');
   }
 
   /**
