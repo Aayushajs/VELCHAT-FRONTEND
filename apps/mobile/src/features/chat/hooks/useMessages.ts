@@ -10,6 +10,7 @@ import {
   countMessages,
   MESSAGE_PAGE,
   Message,
+  clearConversationNotification,
 } from '../../../infra';
 import { syncEngine } from '../../../domain/sync';
 
@@ -65,6 +66,10 @@ export function useMessages(conversationId: string): {
     // the sender's ticks never turn blue, because the read was only ever reported once, at mount.
     syncEngine.setActiveConversation(conversationId);
     void syncEngine.markConversationRead(conversationId);
+    // The tray notification for this chat is stale the instant it is on screen — and it is
+    // still there after a notification TAP, because tapping opens the app without clearing the
+    // stacked "3 new messages" counter behind it.
+    clearConversationNotification(conversationId);
     let sub: { unsubscribe: () => void } | undefined;
     try {
       sub = observeMessages(conversationId, limit).subscribe(setMessages);

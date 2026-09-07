@@ -15,11 +15,12 @@
  *    A direct import would close an `infra → domain → infra` cycle through the barrels.
  */
 import { Platform } from 'react-native';
-import { log } from '../../core';
+import { appEnv, log } from '../../core';
 import { kv } from '../kv';
 import { getAccountId, getDeviceId } from '../network';
 import { hasNotificationPermission, subscribeAppState } from '../native';
 import { clearPushEndpoint, registerPushEndpoint } from './api';
+import { collapsePendingEvents } from './pendingEvents';
 import { nativePush } from './nativePush';
 import {
   INITIAL_PUSH_STATUS,
@@ -28,7 +29,12 @@ import {
   registrationKey,
   shouldRegister,
 } from './pushState';
-import type { PushEvent, PushMessage, PushStatus } from './types';
+import type {
+  PushEvent,
+  PushMessage,
+  PushPendingEvent,
+  PushStatus,
+} from './types';
 
 /**
  * Persisted registration lease. Without it every cold start re-POSTs an unchanged endpoint; with
@@ -76,11 +82,16 @@ let lastPublishedAvailability: boolean | null = null;
 
 const availabilityListeners = new Set<(available: boolean) => void>();
 const messageListeners = new Set<(message: PushMessage) => void>();
+const eventListeners = new Set<(event: PushPendingEvent) => void>();
 
 /** Owned subscriptions — every one of these is released by `disposePush()`. */
 let unsubToken: (() => void) | null = null;
 let unsubMessage: (() => void) | null = null;
 let unsubAppState: (() => void) | null = null;
+let unsubPending: (() => void) | null = null;
+
+/** Single-flight for the queue drain — see `drainPendingEvents`. */
+let draining: Promise<void> | null = null;
 
 /** Single-flight guard so a mount effect and a login cannot register twice in parallel. */
 let inFlight: Promise<void> | null = null;
@@ -139,6 +150,89 @@ export function subscribePushMessages(
   return () => messageListeners.delete(cb);
 }
 
+/**
+ * Observe actions the user took on a notification — Reply, Mark as read, Mute — plus the two
+ * housekeeping events native can raise (`token`, `resync`).
+ *
+ * Subscribe BEFORE calling `initPush()`. Each event is delivered exactly once, and the native
+ * queue is emptied by the drain that produces it, so a listener attached afterwards can miss a
+ * batch entirely. `features/push` owns the handler; this layer must not reach into `domain/`.
+ */
+export function subscribePushEvents(
+  cb: (event: PushPendingEvent) => void,
+): () => void {
+  eventListeners.add(cb);
+  return () => eventListeners.delete(cb);
+}
+
+/**
+ * Drain the native queue of notification actions and hand them to the listeners.
+ *
+ * Single-flight, because three things call it — init, the native `pending` signal, and every
+ * foreground — and they routinely overlap. Two concurrent drains would not double-apply (the
+ * native side hands each entry to exactly one caller) but the second would return empty and
+ * look like the queue was already handled, which is a confusing thing to debug.
+ *
+ * Events are collapsed first: redundant read watermarks and mutes for one conversation become
+ * one apply each, while replies keep their order and their count.
+ */
+export function drainPendingEvents(): Promise<void> {
+  if (draining) return draining;
+  draining = (async () => {
+    try {
+      const events = collapsePendingEvents(
+        await nativePush.takePendingEvents(),
+      );
+      if (events.length === 0) return;
+      log.info('push: applying queued notification actions', {
+        count: events.length,
+      });
+      for (const event of events) {
+        for (const listener of eventListeners) {
+          try {
+            listener(event);
+          } catch (err) {
+            // One bad handler must not swallow the rest of the batch — these are already
+            // drained natively, so a thrown listener would lose the remaining events.
+            log.warn('push event listener threw', { reason: String(err) });
+          }
+        }
+      }
+    } catch (err) {
+      log.warn('push: drain failed', { reason: String(err) });
+    } finally {
+      draining = null;
+    }
+  })();
+  return draining;
+}
+
+/**
+ * Mirror conversation display names into native storage so a notification posted by a killed
+ * app can name the chat instead of saying "VelChat". The push carries ids only (§A19).
+ *
+ * Best-effort and cheap; call it whenever the chat list is refreshed.
+ */
+export function syncConversationNames(
+  names: Readonly<Record<string, string>>,
+): void {
+  if (Object.keys(names).length === 0) return;
+  void nativePush.setConversationNames(names);
+}
+
+/** Keep the native mute in step with a pref set inside the app. `0` clears it. */
+export function setNativeMute(
+  conversationId: string,
+  untilMillis: number,
+): void {
+  void nativePush.setMuted(conversationId, untilMillis);
+}
+
+/** The user opened a chat — drop its notification rather than leave a stale one in the tray. */
+export function clearConversationNotification(conversationId: string): void {
+  void nativePush.clearConversationNotification(conversationId);
+}
+
 // ── lifecycle ────────────────────────────────────────────────────────────────
 
 function installListeners(): void {
@@ -162,14 +256,36 @@ function installListeners(): void {
       }
     });
   }
+  if (!unsubPending) {
+    unsubPending = nativePush.onPendingEvents(() => {
+      void drainPendingEvents();
+    });
+  }
   if (!unsubAppState) {
     unsubAppState = subscribeAppState(state => {
       // Permission can be revoked from Settings while we sleep. Re-check on every foreground:
       // if it is gone, availability must drop so the SyncEngine stops trusting push.
       if (state !== 'active') return;
       void refreshPermission();
+      // A signal emitted while JS was dead is gone; the queue is not. Foreground is the
+      // backstop that guarantees a reply typed into a notification eventually sends.
+      void drainPendingEvents();
     });
   }
+}
+
+/**
+ * Hand native the credentials a woken, JS-less process needs to acknowledge delivery.
+ *
+ * Called after every successful registration and on every session change, because all three
+ * parts can move independently: the base URL with the build, the device id with a reinstall,
+ * the account with a sign-in.
+ */
+function mirrorCredentials(): void {
+  const accountId = getAccountId();
+  const deviceId = getDeviceId();
+  if (!accountId || !deviceId) return;
+  void nativePush.setCredentials(appEnv.apiBaseUrl, deviceId, accountId);
 }
 
 async function refreshPermission(): Promise<void> {
@@ -207,6 +323,12 @@ async function syncRegistration(): Promise<void> {
   }
 
   const key = registrationKey(accountId, deviceId, token);
+
+  // Unconditionally, before the lease check: a cold start that SKIPS the network call still has
+  // to re-mirror these, because native storage can be cleared independently of ours (app data
+  // partially wiped, a restore from backup). Skipping it there is how a device ends up
+  // registered for push yet unable to acknowledge a single delivery.
+  mirrorCredentials();
 
   // A live lease for exactly this triple means the backend already has it: skip the call.
   const stored = readStoredRegistration();
@@ -254,6 +376,10 @@ export function initPush(): Promise<void> {
         return;
       }
       installListeners();
+      // Drain BEFORE anything can fail below: a reply the user typed into a notification is
+      // already owed to them, and it must not be held hostage by a revoked permission or a
+      // registration that cannot complete offline.
+      await drainPendingEvents();
       await refreshPermission();
       if (status.permission !== 'granted') {
         log.info(
@@ -302,8 +428,11 @@ export async function unregisterPush(): Promise<void> {
   //    account's pushes can never be delivered here, even if the server row survives.
   await nativePush.deleteToken();
 
-  // 3. Drop anything that could leak into the next sign-in.
+  // 3. Drop anything that could leak into the next sign-in — including the native mirror of
+  //    the ack credentials, the conversation names, and any queued action. Leaving those behind
+  //    would let a push meant for the previous account be acknowledged by the next one.
   forgetStoredRegistration();
+  await nativePush.clearSession();
   await nativePush.clearDisplayedNotifications();
   apply({ type: 'unregistered' });
   log.info('push unregistered');
@@ -317,11 +446,14 @@ export function disposePush(): void {
   unsubToken?.();
   unsubMessage?.();
   unsubAppState?.();
+  unsubPending?.();
   unsubToken = null;
   unsubMessage = null;
   unsubAppState = null;
+  unsubPending = null;
   messageListeners.clear();
   availabilityListeners.clear();
+  eventListeners.clear();
 }
 
 /** Test-only: reset module state between cases. */
@@ -330,5 +462,6 @@ export function __resetPushForTests(): void {
   status = INITIAL_PUSH_STATUS;
   lastPublishedAvailability = null;
   inFlight = null;
+  draining = null;
   forgetStoredRegistration();
 }

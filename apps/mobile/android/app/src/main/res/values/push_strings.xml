@@ -1,0 +1,40 @@
+<!--
+  Notification strings + the accent colour, kept in their own file so the push layer does not
+  reach into `strings.xml`/`styles.xml` (which the RN template owns and regenerates).
+
+  `translatable="false"` is NOT set: these are the only user-visible strings the native side
+  produces, and they are the first thing a localisation pass would want.
+-->
+<resources>
+    <!-- Notification channels (user-visible in Android Settings → Notifications). -->
+    <string name="push_channel_messages_name">Messages</string>
+    <string name="push_channel_messages_desc">New messages in your chats</string>
+    <string name="push_channel_calls_name">Calls</string>
+    <string name="push_channel_calls_desc">Incoming voice and video calls</string>
+
+    <!-- Notification body. The server sends ids only (no content, by design), so a notification
+         posted from a woken app can name the conversation but not quote the message. -->
+    <string name="push_new_message">New message</string>
+    <plurals name="push_new_messages">
+        <item quantity="one">%d new message</item>
+        <item quantity="other">%d new messages</item>
+    </plurals>
+    <string name="push_incoming_call">Incoming call</string>
+
+    <!-- Actions. -->
+    <string name="push_action_reply">Reply</string>
+    <string name="push_action_reply_hint">Message</string>
+    <string name="push_action_mark_read">Mark as read</string>
+    <string name="push_action_mute">Mute</string>
+    <string name="push_reply_sending">Sending…</string>
+
+    <!-- Group summary. -->
+    <string name="push_summary_title">VelChat</string>
+    <plurals name="push_summary_text">
+        <item quantity="one">%d new message</item>
+        <item quantity="other">%d new messages</item>
+    </plurals>
+
+    <!-- Brand violet — the notification accent, matching the app's gradient start. -->
+    <color name="push_accent">#7C5CFF</color>
+</resources>

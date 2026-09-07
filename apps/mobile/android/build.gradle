@@ -15,6 +15,26 @@ buildscript {
         classpath("com.android.tools.build:gradle")
         classpath("com.facebook.react:react-native-gradle-plugin")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+
+        // Firebase push (ADR 0008) — CONDITIONAL, and that is the point.
+        //
+        // The google-services plugin FAILS the build when no google-services.json exists, and
+        // this repo must stay clonable-and-buildable without a Firebase project: push then
+        // reports `unsupported`, `pushAvailable` stays false, and the SyncEngine keeps its
+        // background socket (i.e. the behaviour before push existed). Pulling the classpath in
+        // only when a config is actually present also keeps a fresh clone from downloading a
+        // plugin it will never apply.
+        //
+        // The predicate here is deliberately BROADER than the one in `app/build.gradle`: any
+        // flavor having a config is enough to fetch the plugin, while applying it is decided
+        // per build. Classpath-present-but-unapplied is free; the reverse is a hard failure.
+        def appDir = new File(buildscript.sourceFile.parentFile, "app")
+        def srcDirs = new File(appDir, "src").listFiles()
+        def anyFirebaseConfig = new File(appDir, "google-services.json").exists() ||
+            (srcDirs != null && srcDirs.any { new File(it, "google-services.json").exists() })
+        if (anyFirebaseConfig) {
+            classpath("com.google.gms:google-services:4.4.2")
+        }
     }
 }
 

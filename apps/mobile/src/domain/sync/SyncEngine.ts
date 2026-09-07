@@ -209,6 +209,8 @@ class SyncEngine {
   // One-shot crash-recovery: resets outbox rows orphaned in `sending` by a prior kill.
   // The first drain awaits it so it can't claim behind a stuck row.
   private recovery: Promise<unknown> | null = null;
+  /** Single-flight for `resyncNow()` — see the note there. */
+  private pushResync: Promise<void> | null = null;
 
   /**
    * Declare that push can wake the app. Until this is true the engine keeps its socket while
@@ -336,6 +338,9 @@ class SyncEngine {
     this.loadingOlder.clear();
     this.namedPeers.clear();
     this.activePresencePeers.clear();
+    // Not awaited, but it must not be remembered: a resync in flight when the session ends would
+    // otherwise make the NEXT session's first `resyncNow()` a no-op returning the old promise.
+    this.pushResync = null;
     useRealtimeStore.getState().reset();
     const s = this.socket;
     this.socket = null;
@@ -615,6 +620,28 @@ class SyncEngine {
 
   // ── catch-up (reconnect backfill) ────────────────────────────────────────
   /**
+   * Catch up now, on demand — the push layer's entry point (§M13 "push → bounded sync → sleep").
+   *
+   * Single-flighted against itself, because the two callers can easily coincide: a data push
+   * arriving while JS is alive, and FCM reporting that it DROPPED messages for this device. Two
+   * concurrent walks would double every backfill request for no gain.
+   *
+   * Deliberately reuses the reconnect path rather than fetching the pushed message by id: a push
+   * is a hint, not a delivery, and the cursor sync is what makes "we have everything up to N"
+   * true even when several pushes were coalesced or dropped (§G4).
+   */
+  async resyncNow(): Promise<void> {
+    if (this.stopped) return;
+    if (this.pushResync) return this.pushResync;
+    this.pushResync = this.resyncAll()
+      .catch(() => undefined)
+      .finally(() => {
+        this.pushResync = null;
+      });
+    return this.pushResync;
+  }
+
+  /**
    * Catch up every conversation after a reconnect. Four properties are deliberate:
    *
    *  - The conversation on screen goes FIRST. Everything else can settle in the background; the
@@ -887,16 +914,20 @@ class SyncEngine {
       if (m.senderId !== getAccountId()) {
         void this.nameStubConversation(m.conversationId, m.senderId);
         this.noteDelivered(m.conversationId, m.seq);
-        // Landed in the chat the user is currently reading → it is read, now. Clearing the badge
-        // here is what stops it from climbing on the open conversation, and the read watermark is
-        // what turns the sender's ticks blue while they watch.
-        if (this.activeConversationId === m.conversationId) {
-          this.noteRead(m.conversationId, m.seq);
-          try {
-            await clearUnread(m.conversationId);
-          } catch {
-            // badge cosmetics only — never fail the inbound path over it
-          }
+      }
+      // A message that lands in the conversation ON SCREEN has been seen — whoever sent it.
+      //
+      // This deliberately sits OUTSIDE the "from someone else" guard. In a chat with yourself
+      // every message is your own, so gating the read on a foreign sender meant the watermark
+      // never advanced while the chat was open: the tick stayed on sent until you left and came
+      // back, where the mount-time read finally reported it. Reading a chat you are looking at is
+      // true regardless of who wrote the message.
+      if (this.activeConversationId === m.conversationId) {
+        this.noteRead(m.conversationId, m.seq);
+        try {
+          await clearUnread(m.conversationId);
+        } catch {
+          // badge cosmetics only — never fail the inbound path over it
         }
       }
     } catch (e) {
@@ -938,14 +969,37 @@ class SyncEngine {
     void this.drainOutbox();
   }
 
-  private async drainOutbox(): Promise<void> {
+  /**
+   * Transmit the outbox once, WITHOUT the engine running and without a socket — the headless
+   * push wake (§M13 "push → bounded work → sleep").
+   *
+   * A reply typed into a notification writes its bubble and its outbox row like any other send,
+   * but `kickOutbox` is gated on a started, online engine, and in a headless JS context neither
+   * is true: `stopped` is still its initial `true` and `online` has never been seeded from
+   * NetInfo. So the message would sit in the queue until the user next opened the app, which is
+   * precisely the wait replying from the notification is supposed to avoid.
+   *
+   * Sending is plain REST (`sendChatMessage`) and stays valid without a socket, so lifting the
+   * lifecycle gate here costs nothing and changes no behaviour for the running engine: if it is
+   * live and already draining, the `draining` guard makes this a no-op.
+   */
+  async flushOutboxNow(): Promise<void> {
+    await this.drainOutbox({ ignoreLifecycle: true });
+  }
+
+  private async drainOutbox(
+    opts: { ignoreLifecycle?: boolean } = {},
+  ): Promise<void> {
     if (this.draining) return;
     this.draining = true;
     try {
       // Never claim before crash-recovery has un-stuck orphaned `sending` rows.
       if (this.recovery) await this.recovery;
       for (;;) {
-        if (this.stopped || !this.online || !hasSession()) break;
+        // `hasSession()` is checked either way: without tokens there is nothing to send, and no
+        // caller may bypass that.
+        if (!hasSession()) break;
+        if (!opts.ignoreLifecycle && (this.stopped || !this.online)) break;
         // Rate limited a moment ago — walking the queue now just re-earns the 429 and burns an
         // attempt on every message behind it.
         if (Date.now() < this.outboxCooldownUntil) break;

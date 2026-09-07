@@ -15,17 +15,29 @@
  */
 import { NativeEventEmitter, NativeModules, Platform } from 'react-native';
 import { log } from '../../core';
+import { parsePendingEvents } from './pendingEvents';
 import type { NativePushBinding, PushMessage } from './types';
 
 /** Event names emitted by the native side. Keep in sync with `PushBridge.kt`. */
 const EVENT_TOKEN = 'velchat.push.token';
 const EVENT_MESSAGE = 'velchat.push.message';
+const EVENT_PENDING = 'velchat.push.pending';
 
 interface VelChatPushNativeModule {
   isSupported(): Promise<boolean>;
   getToken(): Promise<string | null>;
   deleteToken(): Promise<void>;
   clearNotifications(): Promise<void>;
+  clearConversation(conversationId: string): Promise<void>;
+  setCredentials(
+    baseUrl: string | null,
+    deviceId: string | null,
+    accountId: string | null,
+  ): Promise<void>;
+  clearSession(): Promise<void>;
+  setConversationNames(names: Record<string, string>): Promise<void>;
+  setMuted(conversationId: string, untilMillis: number): Promise<void>;
+  takePendingEvents(): Promise<unknown>;
   /** Required by NativeEventEmitter; no-ops on the native side. */
   addListener(eventName: string): void;
   removeListeners(count: number): void;
@@ -98,6 +110,13 @@ const unsupportedBinding: NativePushBinding = {
   onTokenRefresh: () => () => undefined,
   onMessage: () => () => undefined,
   clearDisplayedNotifications: () => Promise.resolve(),
+  setCredentials: () => Promise.resolve(),
+  clearSession: () => Promise.resolve(),
+  setConversationNames: () => Promise.resolve(),
+  setMuted: () => Promise.resolve(),
+  clearConversationNotification: () => Promise.resolve(),
+  onPendingEvents: () => () => undefined,
+  takePendingEvents: () => Promise.resolve([]),
 };
 
 const androidBinding = (mod: VelChatPushNativeModule): NativePushBinding => ({
@@ -157,6 +176,70 @@ const androidBinding = (mod: VelChatPushNativeModule): NativePushBinding => ({
       await mod.clearNotifications();
     } catch {
       // Cosmetic only — never worth surfacing.
+    }
+  },
+
+  async setCredentials(baseUrl, deviceId, accountId) {
+    try {
+      await mod.setCredentials(baseUrl, deviceId, accountId);
+    } catch (err) {
+      // Losing this means a closed app cannot acknowledge delivery, so it is worth a line —
+      // but not worth failing the caller, which is a launch path.
+      log.warn('push: could not mirror ack credentials', {
+        reason: String(err),
+      });
+    }
+  },
+
+  async clearSession() {
+    try {
+      await mod.clearSession();
+    } catch (err) {
+      log.info('push: native session clear failed', { reason: String(err) });
+    }
+  },
+
+  async setConversationNames(names) {
+    try {
+      await mod.setConversationNames({ ...names });
+    } catch {
+      // A notification falls back to a generic title. Not worth a log line per sync.
+    }
+  },
+
+  async setMuted(conversationId, untilMillis) {
+    try {
+      await mod.setMuted(conversationId, untilMillis);
+    } catch {
+      // The server-side pref is authoritative; this is the local fast path.
+    }
+  },
+
+  async clearConversationNotification(conversationId) {
+    try {
+      await mod.clearConversation(conversationId);
+    } catch {
+      // Cosmetic.
+    }
+  },
+
+  onPendingEvents(cb) {
+    const em = getEmitter();
+    if (!em) return () => undefined;
+    const sub = em.addListener(EVENT_PENDING, () => cb());
+    return () => sub.remove();
+  },
+
+  async takePendingEvents() {
+    try {
+      return parsePendingEvents(await mod.takePendingEvents());
+    } catch (err) {
+      // The native queue is drained by that call, so there is nothing to retry. Report it —
+      // a user's reply silently disappearing is exactly the kind of thing to have a line for.
+      log.warn('push: draining queued notification actions failed', {
+        reason: String(err),
+      });
+      return [];
     }
   },
 });

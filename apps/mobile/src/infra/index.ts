@@ -178,4 +178,24 @@ export type {
   ContactsAccess,
   AppStateStatus,
 } from './native';
+export {
+  initPush,
+  unregisterPush,
+  disposePush,
+  getPushStatus,
+  subscribePushAvailability,
+  subscribePushMessages,
+  subscribePushEvents,
+  drainPendingEvents,
+  syncConversationNames,
+  setNativeMute,
+  clearConversationNotification,
+} from './push';
+export type {
+  PushMessage,
+  PushPendingEvent,
+  PushPermission,
+  PushPhase,
+  PushStatus,
+} from './push';
 export { toE164, regionFromE164, yieldToEventLoop, mapYielding } from './util';

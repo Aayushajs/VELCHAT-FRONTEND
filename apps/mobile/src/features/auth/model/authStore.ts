@@ -18,6 +18,7 @@ import {
 import { clearProfileCache, clearContactAvatarCache } from '../../user';
 import { clearContactsDiscoveryCache } from '../../contacts';
 import { clearConversationPeerCache, clearStartDmCache } from '../../chat';
+import { shutdownPushForSignOut } from '../../notifications';
 import { logout } from '../api/authApi';
 import type { Tokens } from '../api/authApi';
 
@@ -79,6 +80,12 @@ export const useAuthStore = create<AuthStore>(set => ({
     // Best-effort server-side revoke (fire-and-forget) BEFORE we drop the local token.
     const refresh = getRefreshToken();
     if (refresh) void logout(refresh).catch(() => undefined);
+    // Un-register push while the bearer token is still valid, and — more importantly — clear
+    // the credentials mirrored into native storage. Those let a woken, JS-less process
+    // acknowledge deliveries; left behind, the NEXT account on this handset would acknowledge
+    // pushes addressed to the previous one. Fire-and-forget so sign-out never blocks on the
+    // network, but it must be started before `clearSession()` drops the token it needs.
+    void shutdownPushForSignOut().catch(() => undefined);
     clearSession();
     clearDeviceKey(); // full logout — next sign-in re-provisions via OTP (no silent relogin)
     kv.delete(KVKeys.phone);

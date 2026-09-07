@@ -70,6 +70,38 @@ export interface PushMessage {
 }
 
 /**
+ * Something the user did on a notification while no JS runtime existed.
+ *
+ * These are queued natively (`PushStore`) and drained by JS, because each one needs the user's
+ * real session to finish: a reply goes through the outbox, a mute has to reach
+ * `PUT /notifications/prefs`, a read has to clear the local unread badge. Native can send the
+ * *receipt* on its own — it has the push token — but not any of this.
+ *
+ * `resync` is the odd one out: FCM told us it DROPPED messages for this device, so there are no
+ * ids to act on and the only correct response is a cursor sync.
+ */
+export type PushPendingEvent =
+  | {
+      readonly type: 'reply';
+      readonly conversationId: string;
+      readonly text: string;
+      readonly upToSeq?: number;
+      readonly at?: number;
+    }
+  | {
+      readonly type: 'read';
+      readonly conversationId: string;
+      readonly upToSeq?: number;
+    }
+  | {
+      readonly type: 'mute';
+      readonly conversationId: string;
+      readonly mutedUntil: number;
+    }
+  | { readonly type: 'token'; readonly token: string }
+  | { readonly type: 'resync' };
+
+/**
  * The per-OS binding. Android is implemented (FCM); iOS is a typed `unsupported` stub until
  * the APNs/PushKit module is authored and built on a Mac (§M2 — never claimed verified here).
  */
@@ -86,6 +118,45 @@ export interface NativePushBinding {
   onMessage(cb: (message: PushMessage) => void): () => void;
   /** Remove any notifications this app posted (called after a successful catch-up). */
   clearDisplayedNotifications(): Promise<void>;
+
+  /**
+   * Mirror what a woken, JS-less process needs in order to authenticate a delivery receipt:
+   * the API origin, the device id, and the account it belongs to.
+   *
+   * This is the seam that makes a closed app able to say "delivered". Native cannot read MMKV
+   * (it is initialised from JS) and cannot mint a JWT (refreshing one from native would rotate
+   * the refresh family behind this side's back), so JS hands it the one credential that works.
+   */
+  setCredentials(
+    baseUrl: string,
+    deviceId: string,
+    accountId: string,
+  ): Promise<void>;
+
+  /** Sign-out: drop every native trace of the account that is leaving. */
+  clearSession(): Promise<void>;
+
+  /**
+   * Mirror `conversationId -> display name`, so a notification posted from native can name the
+   * chat. The push itself carries ids only (§A19), so without this the title is generic.
+   */
+  setConversationNames(names: Readonly<Record<string, string>>): Promise<void>;
+
+  /** Keep the native mute in step with a pref the user set inside the app. 0 clears it. */
+  setMuted(conversationId: string, untilMillis: number): Promise<void>;
+
+  /** The user opened this chat — its notification is stale the moment they are looking at it. */
+  clearConversationNotification(conversationId: string): Promise<void>;
+
+  /**
+   * Native signalled that queued actions are waiting. Carries no data on purpose: draining is
+   * always a pull (`takePendingEvents`), so an event cannot be lost in the window between a JS
+   * runtime existing and this listener being attached. Returns an unsubscribe.
+   */
+  onPendingEvents(cb: () => void): () => void;
+
+  /** Drain the queue. The ONLY thing that empties it — callers must handle what they take. */
+  takePendingEvents(): Promise<PushPendingEvent[]>;
 }
 
 /** The body `POST /notifications/endpoints` expects (backend `RegisterEndpointDto`). */

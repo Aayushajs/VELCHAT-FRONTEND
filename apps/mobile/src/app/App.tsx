@@ -27,6 +27,7 @@ import { startSync, stopSync, syncEngine } from '../domain/sync';
 import { prewarmContacts } from '../features/contacts';
 import { backfillInbox } from '../features/chat';
 import { getProfile } from '../features/user';
+import { startPushRuntime, stopPushRuntime } from '../features/notifications';
 import { useAuthBootstrap } from '../features/auth';
 import { ErrorBoundary } from './ErrorBoundary';
 import { Splash } from './Splash';
@@ -124,6 +125,14 @@ export default function App(): React.JSX.Element {
       disposed = true;
       stopSync();
     };
+  }, []);
+
+  // Push (§M14/§L12, ADR 0008). Separate from the sync effect on purpose: it is what tells the
+  // engine whether it may sleep, and it also drains any Reply / Mark-as-read / Mute the user
+  // pressed on a notification while the app was not running.
+  useEffect(() => {
+    startPushRuntime();
+    return () => stopPushRuntime();
   }, []);
 
   return (
