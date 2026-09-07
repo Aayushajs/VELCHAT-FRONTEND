@@ -66,8 +66,9 @@ def velchatFirebaseConfig = {
 if (velchatFirebaseConfig != null) {
     logger.lifecycle("VelChat push: using ${velchatFirebaseConfig}")
 } else {
+    // ASCII only: the Windows console this is usually read on renders a non-ASCII dash as mojibake.
     logger.lifecycle(
-        "VelChat push: no google-services.json for flavor '${velchatBuildFlavor ?: "(none)"}' — " +
+        "VelChat push: no google-services.json for flavor '${velchatBuildFlavor ?: "(none)"}' - " +
         "building without FCM; push will report unsupported at runtime.")
 }
 
