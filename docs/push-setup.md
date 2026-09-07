@@ -82,7 +82,7 @@ been pasted into a chat, an issue, or a log, **rotate it** (same screen → dele
 sender ──REST──▶ chat-service ──message.sent──▶ notification-service
                                                     │
                                     decideNotify: recipient offline? muted? DND?
-                                                    │ yes → enqueue (ids only, no content)
+                                                    │ yes → enqueue (ids + preview, never names)
                                                     ▼
                                               OutboxWorker ──FCM HTTP v1──▶ device
                                                                               │
@@ -99,15 +99,21 @@ sender ──REST──▶ chat-service ──message.sent──▶ notification
                         message.delivered ──▶ fanout ──▶ sender sees ✓✓
 ```
 
-**The payload carries ids only** — `{conversationId, messageId, seq}` — never message text
-(§A19; `notification.service.ts` builds it). So the notification can name the conversation but
-cannot quote the message. The name comes from a `conversationId -> display name` map that JS
-mirrors into native storage (`PushStore.putConversationNames`, driven off the chat-list
-observation); an unknown conversation falls back to "VelChat".
+**The payload carries no NAMES** — `{conversationId, messageId, seq, senderId, kind, preview?}`.
+Conversation and sender are ids; both are resolved on the device from the display-name maps JS
+mirrors into native storage (`PushStore.putConversationNames` / `putPersonNames`, driven off the
+chat-list observation). An unknown id falls back to "VelChat" rather than to a wrong name.
 
-> **Follow-up, not a bug:** showing a message preview would mean the push carrying the message,
-> which is a privacy-policy decision (and a regression once E2EE lands). If it is ever wanted,
-> it belongs in `notification.service.ts` behind an explicit per-account preference.
+**The payload carries a preview where the server can read one.** `preview.ts` decides: a
+truncated, single-line body for a textual message whose plaintext the server already stores, and
+NOTHING once `ciphertext_ref` is set. So enabling E2EE tightens notifications automatically
+rather than needing anyone to remember this. Attachments send only their `kind` (`image`,
+`audio`, …) and the client renders a localised label.
+
+> **The trade to be aware of:** a preview transits FCM, so Google can see it. That is the
+> difference between this and WhatsApp, and the price of showing the text at all before E2EE
+> exists. `messagePreview(m, allowPreview)` takes the flag already, so a per-account "show
+> preview" toggle is a wiring change in `notification.service.ts`, not a redesign.
 
 ### Notification actions
 
@@ -145,6 +151,19 @@ names, the same rule the `ENVFILE` mapping already documents.
 ## 5. Verifying it end to end
 
 Run these in order; each one isolates a different link in the chain.
+
+**0. Is push wired on the server at all?** Ask it directly — this is the check that would have
+saved the most time, because a server with no `FCM_*` env sends nothing while every push
+"succeeds":
+
+```bash
+curl -s https://velchat.duckdns.org/notifications/push-status
+# → {"transport":"mobile:fcm,web:none","delivers":true,"canAck":true}
+```
+
+`delivers:false` (or `transport:"log"` / `"mobile:none,…"`) means **no phone will ever hear
+anything**, whatever the app does. Fix the env in §2.2 and redeploy before looking at the client.
+`canAck:false` means device acks cannot be published — the second tick will not arrive.
 
 **1. The build actually included Firebase.**
 
@@ -187,7 +206,10 @@ notification on B.
 - **iOS is a typed stub.** `nativePush.ts` reports `unsupported` on iOS. APNs/PushKit
   registration and the `UNUserNotificationCenter` glue must be written and built on a Mac. Not
   built, not tested, not verified here.
-- **No content in notifications** — see §3.
+- **Group sender names.** The name mirror is driven off the chat list, which gives DM peers for
+  free but not group members. A group notification therefore attributes lines to the conversation
+  rather than to the person; mirroring member profiles is a follow-up.
+- **No per-account "show preview" toggle** — the plumbing is there (§3), the preference is not.
 - **VoIP push** (`voipToken`) is accepted by the backend DTO and unused; CallKit/ConnectionService
   is a separate increment.
 - **The module is a legacy `ReactPackage`**, not a codegen TurboModule spec. The bridgeless
