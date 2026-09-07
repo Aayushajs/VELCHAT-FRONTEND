@@ -84,7 +84,17 @@ class VelChatMessagingService : FirebaseMessagingService() {
     // obviously-broken thing a chat app can do, so re-check locally.
     val resumed = PushBridge.isAppResumed(this)
     if (!resumed) {
-      PushNotifications.showMessage(this, store, conversationId, seq)
+      // Isolated on purpose. The ack below is the ONLY thing that can produce a second tick for
+      // a closed app, and it runs after this — so anything that can throw while drawing a
+      // notification (an OEM's NotificationManager refusing `activeNotifications`, a resource
+      // that resolved differently after an update) must not be allowed to take it down with it.
+      // Failing to notify is a visible annoyance; failing to acknowledge is the bug this whole
+      // service exists to fix.
+      try {
+        PushNotifications.showMessage(this, store, conversationId, seq)
+      } catch (e: Throwable) {
+        Log.w(TAG, "notification post failed: ${e.javaClass.simpleName}")
+      }
     }
 
     // Acknowledge REGARDLESS of whether anything was shown. "The device received it" is true

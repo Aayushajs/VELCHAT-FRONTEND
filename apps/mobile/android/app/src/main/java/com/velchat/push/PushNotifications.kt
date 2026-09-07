@@ -187,10 +187,7 @@ internal object PushNotifications {
    */
   private fun postSummary(context: Context, store: PushStore) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return // pre-N has no bundling
-    val active =
-        NotificationManagerCompat.from(context).activeNotifications.count {
-          it.id != SUMMARY_ID && it.notification.group == GROUP_MESSAGES
-        }
+    val active = groupedCount(context) ?: return
     if (active <= 1) {
       // A single conversation reads better on its own than under a summary.
       NotificationManagerCompat.from(context).cancel(SUMMARY_ID)
@@ -221,13 +218,27 @@ internal object PushNotifications {
     nm.cancel(notificationId(conversationId))
     // The summary must go too once it is the last thing left, or it strands as an empty group.
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-      val remaining =
-          nm.activeNotifications.count {
-            it.id != SUMMARY_ID && it.notification.group == GROUP_MESSAGES
-          }
-      if (remaining == 0) nm.cancel(SUMMARY_ID)
+      if (groupedCount(context) == 0) nm.cancel(SUMMARY_ID)
     }
   }
+
+  /**
+   * How many per-conversation notifications this app currently has posted in the message group,
+   * or null when the system will not say.
+   *
+   * `getActiveNotifications()` reaches into the NotificationManager service, and several OEM
+   * builds throw from it rather than returning empty. Both callers are on paths that must not
+   * fail — one runs before the delivery ack in a killed-app wake, the other from a notification
+   * action — so "cannot tell" is answered with null and the summary is simply left alone.
+   */
+  private fun groupedCount(context: Context): Int? =
+      try {
+        NotificationManagerCompat.from(context).activeNotifications.count {
+          it.id != SUMMARY_ID && it.notification.group == GROUP_MESSAGES
+        }
+      } catch (_: Throwable) {
+        null
+      }
 
   fun cancelAll(context: Context, store: PushStore) {
     store.clearAllCounts()
