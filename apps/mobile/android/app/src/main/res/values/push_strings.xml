@@ -12,14 +12,28 @@
     <string name="push_channel_calls_name">Calls</string>
     <string name="push_channel_calls_desc">Incoming voice and video calls</string>
 
-    <!-- Notification body. The server sends ids only (no content, by design), so a notification
-         posted from a woken app can name the conversation but not quote the message. -->
+    <!-- Notification body. The push carries the message text only when the server holds readable
+         plaintext (see the backend's preview.ts); these are the fallbacks for everything else. -->
     <string name="push_new_message">New message</string>
     <plurals name="push_new_messages">
         <item quantity="one">%d new message</item>
         <item quantity="other">%d new messages</item>
     </plurals>
     <string name="push_incoming_call">Incoming call</string>
+
+    <!-- How the user is named in their own notification thread (NotificationCompat.MessagingStyle
+         requires a Person for the local user). -->
+    <string name="push_you">You</string>
+
+    <!-- Attachments have no text body. The push carries the TYPE so these labels can be in the
+         user's language rather than the server's. -->
+    <string name="push_kind_image">Photo</string>
+    <string name="push_kind_video">Video</string>
+    <string name="push_kind_audio">Voice message</string>
+    <string name="push_kind_file">Document</string>
+    <string name="push_kind_location">Location</string>
+    <string name="push_kind_contact">Contact</string>
+    <string name="push_kind_poll">Poll</string>
 
     <!-- Actions. -->
     <string name="push_action_reply">Reply</string>

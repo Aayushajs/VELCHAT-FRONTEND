@@ -82,9 +82,9 @@ internal class PushActionReceiver : BroadcastReceiver() {
           // An empty inline reply is a mis-tap, not an instruction. Leave the notification alone.
           return
         }
-        // Replace the body with "Sending…" rather than cancelling: cancelling would make a reply
-        // that has not left the device yet look complete.
-        PushNotifications.showReplySending(appContext, store, conversationId)
+        // Append the reply to the thread rather than cancelling: cancelling would make a message
+        // that has not left the device yet look sent and gone.
+        PushNotifications.showOwnReply(appContext, store, conversationId, text)
         queueForJs(
             appContext,
             store,

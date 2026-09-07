@@ -86,6 +86,8 @@ internal class PushStore(context: Context) {
         .remove(KEY_ACCOUNT_ID)
         .remove(KEY_PUSH_TOKEN)
         .remove(KEY_NAMES)
+        .remove(KEY_PEOPLE)
+        .remove(KEY_LINES)
         .remove(KEY_MUTED)
         .remove(KEY_PENDING)
         .remove(KEY_COUNTS)
@@ -106,12 +108,27 @@ internal class PushStore(context: Context) {
    * Bounded at {@link MAX_NAMES}, newest-wins, because this is a notification nicety and must
    * never grow into a real cache (§M "no unbounded caches").
    */
-  fun conversationName(conversationId: String): String? =
-      readJson(KEY_NAMES).optString(conversationId, "").takeIf { it.isNotBlank() }
+  fun conversationName(conversationId: String): String? = readName(KEY_NAMES, conversationId)
 
-  fun putConversationNames(names: Map<String, String>) {
+  fun putConversationNames(names: Map<String, String>) = putNames(KEY_NAMES, names)
+
+  /**
+   * `accountId -> display name`, also mirrored from JS.
+   *
+   * Separate from the conversation map because a push names its SENDER by id, and in a group the
+   * sender is not the conversation. Without this, every message in a group notification would be
+   * attributed to nobody — which is precisely the case where knowing who spoke matters most.
+   */
+  fun personName(accountId: String): String? = readName(KEY_PEOPLE, accountId)
+
+  fun putPersonNames(names: Map<String, String>) = putNames(KEY_PEOPLE, names)
+
+  private fun readName(key: String, id: String): String? =
+      readJson(key).optString(id, "").takeIf { it.isNotBlank() }
+
+  private fun putNames(key: String, names: Map<String, String>) {
     if (names.isEmpty()) return
-    val merged = readJson(KEY_NAMES)
+    val merged = readJson(key)
     for ((id, name) in names) {
       if (id.isBlank()) continue
       if (name.isBlank()) merged.remove(id) else merged.put(id, name)
@@ -123,7 +140,88 @@ internal class PushStore(context: Context) {
       if (!it.hasNext()) break
       merged.remove(it.next())
     }
-    prefs.edit().putString(KEY_NAMES, merged.toString()).apply()
+    prefs.edit().putString(key, merged.toString()).apply()
+  }
+
+  // ── the lines shown inside one conversation's notification ─────────────────
+
+  /**
+   * One rendered line in a conversation's notification.
+   *
+   * `mine` marks a reply the user sent FROM the notification. Keeping it in the thread is what
+   * makes an inline reply feel like it went somewhere — without it, the notification silently
+   * drops the message the user just typed and looks like it was swallowed.
+   */
+  data class Line(
+      val sender: String?,
+      val text: String,
+      val at: Long,
+      val mine: Boolean = false,
+  )
+
+  /**
+   * Remember what a conversation's notification is currently showing, so a second message
+   * EXPANDS it into a thread instead of replacing the first.
+   *
+   * This has to be persisted rather than held in memory: each push can arrive in a freshly
+   * started process that is torn down again as soon as `onMessageReceived` returns, so an
+   * in-memory list would be empty every single time and the notification would never stack.
+   *
+   * Bounded twice over — {@link MAX_LINES} per conversation and {@link MAX_LINE_CONVOS}
+   * conversations — because this is notification state, not a message store (§M "no unbounded
+   * caches"). The DB remains the source of truth for everything real.
+   */
+  fun appendLine(conversationId: String, line: Line): List<Line> {
+    val all = readJson(KEY_LINES)
+    val existing = all.optJSONArray(conversationId) ?: JSONArray()
+    existing.put(
+        JSONObject()
+            .put("s", line.sender ?: JSONObject.NULL)
+            .put("t", line.text)
+            .put("at", line.at)
+            .put("me", line.mine))
+    while (existing.length() > MAX_LINES) existing.remove(0)
+    all.put(conversationId, existing)
+    while (all.length() > MAX_LINE_CONVOS) {
+      val it = all.keys()
+      if (!it.hasNext()) break
+      val oldest = it.next()
+      if (oldest == conversationId) {
+        if (!it.hasNext()) break
+        all.remove(it.next())
+      } else {
+        all.remove(oldest)
+      }
+    }
+    prefs.edit().putString(KEY_LINES, all.toString()).apply()
+    return toLines(existing)
+  }
+
+  fun lines(conversationId: String): List<Line> =
+      toLines(readJson(KEY_LINES).optJSONArray(conversationId) ?: JSONArray())
+
+  fun clearLines(conversationId: String) {
+    val all = readJson(KEY_LINES)
+    if (!all.has(conversationId)) return
+    all.remove(conversationId)
+    prefs.edit().putString(KEY_LINES, all.toString()).apply()
+  }
+
+  private fun toLines(arr: JSONArray): List<Line> {
+    val out = ArrayList<Line>(arr.length())
+    for (i in 0 until arr.length()) {
+      val o = arr.optJSONObject(i) ?: continue
+      val text = o.optString("t", "")
+      if (text.isBlank()) continue
+      out.add(
+          Line(
+              o.optString("s", "").takeIf { it.isNotBlank() },
+              text,
+              o.optLong("at", 0L),
+              o.optBoolean("me", false),
+          ))
+    }
+    return out
   }
 
   // ── mute ───────────────────────────────────────────────────────────────────
@@ -217,11 +315,17 @@ internal class PushStore(context: Context) {
     private const val KEY_ACCOUNT_ID = "accountId"
     private const val KEY_PUSH_TOKEN = "pushToken"
     private const val KEY_NAMES = "names"
+    private const val KEY_PEOPLE = "people"
+    private const val KEY_LINES = "lines"
     private const val KEY_MUTED = "muted"
     private const val KEY_COUNTS = "counts"
     private const val KEY_PENDING = "pending"
 
     private const val MAX_NAMES = 300
     private const val MAX_PENDING = 64
+
+    /** Android collapses a MessagingStyle to the last few lines anyway; keeping more is waste. */
+    private const val MAX_LINES = 6
+    private const val MAX_LINE_CONVOS = 20
   }
 }

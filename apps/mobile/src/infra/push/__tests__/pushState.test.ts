@@ -97,18 +97,25 @@ describe('push is NOT available until the backend actually holds the token', () 
 });
 
 describe('permission', () => {
-  it('denial takes an already-registered device back to unavailable', () => {
+  it('denial stops push being AVAILABLE but keeps the registration', () => {
+    // Permission decides whether we may SHOW something, not whether we can be woken: FCM
+    // delivers data messages regardless of POST_NOTIFICATIONS. Dropping the registration here
+    // also killed the delivery receipt a woken app sends — so a recipient who merely switched
+    // notifications off left every sender on one grey tick, permanently.
     const s = run(
       { type: 'permission', permission: 'granted' },
       { type: 'token', token: 'tok-1' },
       { type: 'registered', key: KEY },
       { type: 'permission', permission: 'denied' },
     );
-    expect(s.phase).toBe('denied');
-    expect(isPushAvailable(s)).toBe(false);
+    expect(isPushAvailable(s)).toBe(false); // the SyncEngine must keep its socket
+    expect(s.registeredKey).toBe(KEY); // …but the device stays wakeable
+    expect(s.token).toBe('tok-1');
   });
 
-  it('re-granting permission re-registers rather than assuming the old one still stands', () => {
+  it('re-granting permission restores availability with no re-registration', () => {
+    // The token never went away, so there is nothing to re-POST. Forcing a round trip here was
+    // pure churn on a path that runs on every foreground.
     const s = run(
       { type: 'permission', permission: 'granted' },
       { type: 'token', token: 'tok-1' },
@@ -116,9 +123,9 @@ describe('permission', () => {
       { type: 'permission', permission: 'denied' },
       { type: 'permission', permission: 'granted' },
     );
-    expect(s.phase).toBe('idle');
-    expect(s.registeredKey).toBeNull();
-    expect(shouldRegister(s, KEY)).toBe(true);
+    expect(isPushAvailable(s)).toBe(true);
+    expect(s.registeredKey).toBe(KEY);
+    expect(shouldRegister(s, KEY)).toBe(false);
   });
 
   it('permission events never resurrect an unsupported build', () => {
@@ -185,12 +192,14 @@ describe('shouldRegister — the duplicate-registration guard', () => {
     expect(shouldRegister(registered, otherAccount)).toBe(true);
   });
 
-  it('is false without permission', () => {
-    const denied = reducePush(registered, {
-      type: 'permission',
-      permission: 'denied',
-    });
-    expect(shouldRegister(denied, KEY)).toBe(false);
+  it('is TRUE without permission, for a device that has never registered', () => {
+    // A device that cannot display a notification can still be woken and can still acknowledge
+    // delivery. Refusing to register it is what silently cost the sender their second tick.
+    const denied = run(
+      { type: 'permission', permission: 'denied' },
+      { type: 'token', token: 'tok-1' },
+    );
+    expect(shouldRegister(denied, KEY)).toBe(true);
   });
 
   it('is false without a token', () => {

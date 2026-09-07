@@ -19,6 +19,7 @@ export {
   subscribePushEvents,
   drainPendingEvents,
   syncConversationNames,
+  syncPersonNames,
   setNativeMute,
   clearConversationNotification,
   __resetPushForTests,

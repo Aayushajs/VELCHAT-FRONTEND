@@ -91,7 +91,17 @@ class VelChatMessagingService : FirebaseMessagingService() {
       // Failing to notify is a visible annoyance; failing to acknowledge is the bug this whole
       // service exists to fix.
       try {
-        PushNotifications.showMessage(this, store, conversationId, seq)
+        PushNotifications.showMessage(
+            this,
+            store,
+            conversationId,
+            seq,
+            // Present only when the server genuinely holds readable plaintext; absent for an
+            // encrypted message or an attachment, and the notification degrades on its own.
+            data["preview"],
+            data["kind"],
+            data["senderId"],
+        )
       } catch (e: Throwable) {
         Log.w(TAG, "notification post failed: ${e.javaClass.simpleName}")
       }
@@ -117,6 +127,8 @@ class VelChatMessagingService : FirebaseMessagingService() {
           putString("type", "message")
           putString("conversationId", conversationId)
           data["messageId"]?.let { putString("messageId", it) }
+          data["senderId"]?.let { putString("senderId", it) }
+          data["kind"]?.let { putString("kind", it) }
           if (seq > 0L) putString("seq", seq.toString())
         }
     PushBridge.emit(this, PushBridge.EVENT_MESSAGE, payload)

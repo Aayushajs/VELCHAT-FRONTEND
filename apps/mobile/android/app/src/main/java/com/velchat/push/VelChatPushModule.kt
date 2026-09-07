@@ -136,14 +136,29 @@ class VelChatPushModule(private val reactContext: ReactApplicationContext) :
    */
   @ReactMethod
   fun setConversationNames(names: ReadableMap, promise: Promise) {
+    store.putConversationNames(toStringMap(names))
+    promise.resolve(null)
+  }
+
+  /**
+   * Mirror `accountId -> display name` so a GROUP notification can attribute each line to whoever
+   * sent it. The push names its sender by id only, so without this every message in a group would
+   * arrive unattributed — the case where knowing who spoke matters most.
+   */
+  @ReactMethod
+  fun setPersonNames(names: ReadableMap, promise: Promise) {
+    store.putPersonNames(toStringMap(names))
+    promise.resolve(null)
+  }
+
+  private fun toStringMap(names: ReadableMap): Map<String, String> {
     val map = HashMap<String, String>()
     val it = names.keySetIterator()
     while (it.hasNextKey()) {
       val key = it.nextKey()
       map[key] = names.getString(key) ?: ""
     }
-    store.putConversationNames(map)
-    promise.resolve(null)
+    return map
   }
 
   /** Keep the native mute in step with the server-side pref the user set inside the app. */

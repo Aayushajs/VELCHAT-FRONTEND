@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.Person
 import androidx.core.app.RemoteInput
 import com.velchat.MainActivity
 import com.velchat.R
@@ -23,11 +24,13 @@ import com.velchat.R
  *
  * ## What the notification can and cannot say
  *
- * The server sends **ids only** — no message text, no sender name (§A19; see
- * `notification.service.ts`, which puts `{conversationId, messageId, seq}` in the payload and
- * nothing else). So the title comes from the conversation-name map JS mirrors into
- * {@link PushStore}, and the body is a count. That is a deliberate privacy position, not a gap
- * in this file: quoting the message would mean the push carrying it.
+ * The push carries the message body only when the server genuinely holds readable plaintext —
+ * the backend's `preview.ts` owns that rule and drops the preview the moment a message is
+ * encrypted, so this file must degrade gracefully to "New message" rather than assume a body.
+ *
+ * NAMES are never sent. The push identifies the conversation and the sender by ID, and both are
+ * resolved from the maps JS mirrors into {@link PushStore} — so a display name never leaves the
+ * device, and an unknown id costs a generic title instead of a wrong one.
  *
  * ## The three actions
  *
@@ -100,7 +103,18 @@ internal object PushNotifications {
    * that case: "the device received it" is true regardless of whether the user was told, and
    * conflating the two is what leaves a sender on one tick after the recipient mutes a chat.
    */
-  fun showMessage(context: Context, store: PushStore, conversationId: String, seq: Long): Boolean {
+  fun showMessage(
+      context: Context,
+      store: PushStore,
+      conversationId: String,
+      seq: Long,
+      /** The message body, when the server was able to send one. See the backend's `preview.ts`. */
+      preview: String?,
+      /** Message type — `text`, `image`, … Used to describe a message that has no body. */
+      kind: String?,
+      /** The SENDER's account id. In a group this is not the conversation. */
+      senderId: String?,
+  ): Boolean {
     if (conversationId.isBlank()) return false
     if (store.isMuted(conversationId)) return false
     if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return false
@@ -108,22 +122,36 @@ internal object PushNotifications {
     ensureChannels(context)
 
     val count = store.bumpCount(conversationId)
-    val title = store.conversationName(conversationId) ?: context.getString(R.string.app_name)
-    val body =
-        if (count <= 1) context.getString(R.string.push_new_message)
-        else context.resources.getQuantityString(R.plurals.push_new_messages, count, count)
+    val conversationName =
+        store.conversationName(conversationId) ?: context.getString(R.string.app_name)
+    val senderName = senderId?.let { store.personName(it) }
+    // A DM's conversation name IS the other person, so prefixing there would read "Aayush:
+    // Aayush". A group's differs, and that is exactly when attribution matters. Deriving it this
+    // way avoids mirroring a separate is-group flag that could disagree with the names.
+    val isGroup = senderName != null && senderName != conversationName
+
+    val body = preview?.takeIf { it.isNotBlank() } ?: describeKind(context, kind)
+    val lines =
+        store.appendLine(
+            conversationId,
+            PushStore.Line(senderName ?: conversationName, body, System.currentTimeMillis()),
+        )
 
     val id = notificationId(conversationId)
     val builder =
         NotificationCompat.Builder(context, CHANNEL_MESSAGES)
             .setSmallIcon(R.drawable.ic_notification)
             .setColor(context.getColor(R.color.push_accent))
-            .setContentTitle(title)
-            .setContentText(body)
+            .setStyle(messagingStyle(context, conversationName, isGroup, lines))
+            // Set as well as styled: the lock screen, Wear, and some launchers read these
+            // directly and show nothing at all if only the style is populated.
+            .setContentTitle(conversationName)
+            .setContentText(if (isGroup && lines.size == 1) "${senderName}: $body" else body)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
-            .setOnlyAlertOnce(count > 1) // re-alert for the first, stay quiet while stacking
+            .setWhen(System.currentTimeMillis())
+            .setShowWhen(true)
             .setNumber(count)
             .setGroup(GROUP_MESSAGES)
             .setContentIntent(openConversationIntent(context, conversationId, id))
@@ -136,6 +164,54 @@ internal object PushNotifications {
     postSummary(context, store)
     return true
   }
+
+  /**
+   * Render the conversation as a thread.
+   *
+   * `MessagingStyle` is what gives a chat notification its native shape — per-sender attribution,
+   * the inline-reply affordance wired to the right place, and correct collapsing on the lock
+   * screen and Wear. Building the same thing out of `InboxStyle` looks close and behaves worse.
+   */
+  private fun messagingStyle(
+      context: Context,
+      conversationName: String,
+      isGroup: Boolean,
+      lines: List<PushStore.Line>,
+  ): NotificationCompat.MessagingStyle {
+    val me = Person.Builder().setName(context.getString(R.string.push_you)).setKey("me").build()
+    val style = NotificationCompat.MessagingStyle(me).setGroupConversation(isGroup)
+    if (isGroup) style.conversationTitle = conversationName
+    for (line in lines) {
+      // A reply the user sent from the notification is attributed to THEM, so the thread reads
+      // as a conversation rather than as the peer quoting the user back at themselves.
+      val person =
+          if (line.mine) me
+          else {
+            val name = line.sender ?: conversationName
+            Person.Builder().setName(name).setKey(name).build()
+          }
+      style.addMessage(line.text, line.at, person)
+    }
+    return style
+  }
+
+  /**
+   * What to say about a message with no readable body — an attachment, or an encrypted one.
+   *
+   * Localised HERE rather than sent by the server: the payload carries the type (`image`,
+   * `audio`, …) precisely so the label can be in the user's language instead of the server's.
+   */
+  private fun describeKind(context: Context, kind: String?): String =
+      when (kind) {
+        "image" -> context.getString(R.string.push_kind_image)
+        "video" -> context.getString(R.string.push_kind_video)
+        "audio" -> context.getString(R.string.push_kind_audio)
+        "file" -> context.getString(R.string.push_kind_file)
+        "location" -> context.getString(R.string.push_kind_location)
+        "contact" -> context.getString(R.string.push_kind_contact)
+        "poll" -> context.getString(R.string.push_kind_poll)
+        else -> context.getString(R.string.push_new_message)
+      }
 
   /** An incoming call: its own channel, no reply/mute, and it must not be bundled away. */
   fun showCall(context: Context, callId: String, conversationId: String?) {
@@ -157,25 +233,43 @@ internal object PushNotifications {
   }
 
   /**
-   * Replace the posted notification's body with a transient "Sending…" so an inline reply gives
-   * immediate feedback. The real confirmation is the message appearing in the chat; this only
-   * has to stop the notification looking like the reply was swallowed.
+   * Show a reply the user just typed into the notification, inside the same thread.
+   *
+   * The real confirmation is the message appearing in the chat; this only has to stop the
+   * notification looking like the reply was swallowed while the send is still in flight.
    */
-  fun showReplySending(context: Context, store: PushStore, conversationId: String) {
+  fun showOwnReply(context: Context, store: PushStore, conversationId: String, text: String) {
     if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return
+    val conversationName =
+        store.conversationName(conversationId) ?: context.getString(R.string.app_name)
+    // Append rather than replace: the reply belongs in the thread the user was reading, and
+    // cancelling the notification instead would make a message that has not left the device yet
+    // look like it was sent and gone.
+    val lines =
+        store.appendLine(
+            conversationId,
+            PushStore.Line(null, text, System.currentTimeMillis(), mine = true),
+        )
+    val isGroup = lines.any { !it.mine && it.sender != null && it.sender != conversationName }
+
     val id = notificationId(conversationId)
-    val title = store.conversationName(conversationId) ?: context.getString(R.string.app_name)
     val notification =
         NotificationCompat.Builder(context, CHANNEL_MESSAGES)
             .setSmallIcon(R.drawable.ic_notification)
             .setColor(context.getColor(R.color.push_accent))
-            .setContentTitle(title)
-            .setContentText(context.getString(R.string.push_reply_sending))
+            .setStyle(messagingStyle(context, conversationName, isGroup, lines))
+            .setContentTitle(conversationName)
+            .setContentText(text)
+            .setSubText(context.getString(R.string.push_reply_sending))
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            // LOW and alert-once: the user is standing right there having just typed it. Buzzing
+            // the phone to confirm their own action is noise.
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOnlyAlertOnce(true)
+            .setAutoCancel(true)
             .setGroup(GROUP_MESSAGES)
             .setContentIntent(openConversationIntent(context, conversationId, id))
+            .setDeleteIntent(dismissIntent(context, conversationId, id))
             .build()
     postSafely(context, id, notification)
   }
@@ -214,6 +308,9 @@ internal object PushNotifications {
   fun cancel(context: Context, store: PushStore, conversationId: String) {
     if (conversationId.isBlank()) return
     store.clearCount(conversationId)
+    // Drop the thread too. Without this, opening a chat and then receiving one new message would
+    // rebuild the notification with every line the user had already read.
+    store.clearLines(conversationId)
     val nm = NotificationManagerCompat.from(context)
     nm.cancel(notificationId(conversationId))
     // The summary must go too once it is the last thing left, or it strands as an empty group.

@@ -54,25 +54,12 @@ export function reducePush(s: PushStatus, e: PushEvent): PushStatus {
 
     case 'permission': {
       if (s.phase === 'unsupported') return s; // permission can't conjure a transport
-      if (e.permission === 'granted') {
-        if (s.permission === 'granted') return s; // re-asserting on every foreground: no churn
-        // Coming back from a denial. The registration is NOT assumed to still stand — the
-        // server may have pruned it, and re-POSTing is cheap (it is an upsert).
-        return {
-          ...s,
-          permission: 'granted',
-          phase: 'idle',
-          registeredKey: null,
-          error: null,
-        };
-      }
-      if (s.permission === e.permission && s.phase === 'denied') return s;
-      return {
-        ...s,
-        permission: e.permission,
-        phase: 'denied',
-        registeredKey: null,
-      };
+      if (s.permission === e.permission) return s; // re-asserted on every foreground: no churn
+      // Permission decides whether we may SHOW something, not whether we can be woken: FCM
+      // delivers data messages regardless of POST_NOTIFICATIONS. The registration therefore
+      // survives a denial untouched — dropping it would also kill the delivery receipt a woken
+      // app sends, i.e. the sender's second tick, for a recipient who merely muted the OS.
+      return { ...s, permission: e.permission };
     }
 
     case 'token': {
@@ -132,7 +119,9 @@ export function isPushAvailable(s: PushStatus): boolean {
  */
 export function shouldRegister(s: PushStatus, key: string): boolean {
   if (s.phase === 'unsupported' || s.phase === 'registering') return false;
-  if (s.permission !== 'granted') return false;
+  // Deliberately NOT gated on permission. A device that cannot show a notification can still be
+  // woken by a data message and still acknowledge delivery — and refusing to register it was
+  // silently costing the sender their second tick whenever the recipient had notifications off.
   if (s.token === null) return false;
   return s.registeredKey !== key;
 }

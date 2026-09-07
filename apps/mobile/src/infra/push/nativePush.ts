@@ -36,6 +36,7 @@ interface VelChatPushNativeModule {
   ): Promise<void>;
   clearSession(): Promise<void>;
   setConversationNames(names: Record<string, string>): Promise<void>;
+  setPersonNames(names: Record<string, string>): Promise<void>;
   setMuted(conversationId: string, untilMillis: number): Promise<void>;
   takePendingEvents(): Promise<unknown>;
   /** Required by NativeEventEmitter; no-ops on the native side. */
@@ -113,6 +114,7 @@ const unsupportedBinding: NativePushBinding = {
   setCredentials: () => Promise.resolve(),
   clearSession: () => Promise.resolve(),
   setConversationNames: () => Promise.resolve(),
+  setPersonNames: () => Promise.resolve(),
   setMuted: () => Promise.resolve(),
   clearConversationNotification: () => Promise.resolve(),
   onPendingEvents: () => () => undefined,
@@ -204,6 +206,14 @@ const androidBinding = (mod: VelChatPushNativeModule): NativePushBinding => ({
       await mod.setConversationNames({ ...names });
     } catch {
       // A notification falls back to a generic title. Not worth a log line per sync.
+    }
+  },
+
+  async setPersonNames(names) {
+    try {
+      await mod.setPersonNames({ ...names });
+    } catch {
+      // A group notification falls back to an unattributed line. Same reasoning.
     }
   },
 

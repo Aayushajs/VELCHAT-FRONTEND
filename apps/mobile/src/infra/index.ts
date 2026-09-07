@@ -188,6 +188,7 @@ export {
   subscribePushEvents,
   drainPendingEvents,
   syncConversationNames,
+  syncPersonNames,
   setNativeMute,
   clearConversationNotification,
 } from './push';

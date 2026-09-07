@@ -28,7 +28,12 @@ export type PushPermission = 'granted' | 'denied' | 'unavailable';
  *   failed       we hold a token but the backend refused/was unreachable; retried on next init
  */
 export type PushPhase =
-  'idle' | 'unsupported' | 'denied' | 'registering' | 'registered' | 'failed';
+  | 'idle'
+  | 'unsupported'
+  | 'denied'
+  | 'registering'
+  | 'registered'
+  | 'failed';
 
 /** The whole push state, in one plain object. Pure — see `pushState.ts`. */
 export interface PushStatus {
@@ -141,6 +146,12 @@ export interface NativePushBinding {
    * chat. The push itself carries ids only (§A19), so without this the title is generic.
    */
   setConversationNames(names: Readonly<Record<string, string>>): Promise<void>;
+
+  /**
+   * Mirror `accountId -> display name`, so a GROUP notification can say who sent each line. The
+   * push identifies its sender by id only; a name never leaves the device.
+   */
+  setPersonNames(names: Readonly<Record<string, string>>): Promise<void>;
 
   /** Keep the native mute in step with a pref the user set inside the app. 0 clears it. */
   setMuted(conversationId: string, untilMillis: number): Promise<void>;

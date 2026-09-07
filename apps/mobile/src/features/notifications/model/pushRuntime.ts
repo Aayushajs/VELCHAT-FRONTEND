@@ -32,6 +32,7 @@ import {
   subscribePushMessages,
   unregisterPush,
   syncConversationNames,
+  syncPersonNames,
   observeConversations,
   type PushPendingEvent,
 } from '../../../infra';
@@ -144,11 +145,18 @@ function startNameMirror(): void {
   try {
     namesSub = observeConversations(NAME_MIRROR_LIMIT).subscribe(rows => {
       const names: Record<string, string> = {};
+      const people: Record<string, string> = {};
       for (const row of rows) {
         const name = row.name?.trim();
-        if (name) names[row.id] = name;
+        if (!name) continue;
+        names[row.id] = name;
+        // A DM's title IS the other person, so this doubles as their display name — which is
+        // what lets a notification attribute the message to a sender rather than to nobody.
+        // Group members are not covered here and fall back to the conversation's own name.
+        if (row.peerId) people[row.peerId] = name;
       }
       syncConversationNames(names);
+      syncPersonNames(people);
     });
   } catch {
     // No DB yet (first launch, before the adapter opens). Notifications fall back to a generic

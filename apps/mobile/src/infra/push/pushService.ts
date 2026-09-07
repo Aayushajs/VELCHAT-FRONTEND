@@ -220,6 +220,17 @@ export function syncConversationNames(
   void nativePush.setConversationNames(names);
 }
 
+/**
+ * Mirror `accountId -> display name` so a GROUP notification can say who sent each line.
+ *
+ * Split from the conversation mirror because the two have different lifetimes: conversation
+ * names change when the chat list does, member names when a profile is resolved.
+ */
+export function syncPersonNames(names: Readonly<Record<string, string>>): void {
+  if (Object.keys(names).length === 0) return;
+  void nativePush.setPersonNames(names);
+}
+
 /** Keep the native mute in step with a pref set inside the app. `0` clears it. */
 export function setNativeMute(
   conversationId: string,
@@ -291,11 +302,14 @@ function mirrorCredentials(): void {
 async function refreshPermission(): Promise<void> {
   if (status.phase === 'unsupported') return;
   const granted = await hasNotificationPermission();
-  const before = status.phase;
+  const before = status.permission;
   apply({ type: 'permission', permission: granted ? 'granted' : 'denied' });
-  // A re-grant resets the machine to `idle` — register again on the spot rather than making
-  // the user relaunch the app to get push back.
-  if (granted && before === 'denied') void syncRegistration();
+  // A re-grant does not need a re-registration (the token never went away), but it DOES change
+  // availability — and `apply` has already published that. Re-run registration only when we
+  // still hold no token, so a grant is also the moment a first-run failure heals.
+  if (granted && before !== 'granted' && status.token === null) {
+    void syncRegistration();
+  }
 }
 
 /**
@@ -303,7 +317,12 @@ async function refreshPermission(): Promise<void> {
  * Safe to call at any time; does nothing when there is nothing to do.
  */
 async function syncRegistration(): Promise<void> {
-  if (status.phase === 'unsupported' || status.permission !== 'granted') return;
+  // No permission check. FCM issues a token and delivers data messages regardless of
+  // POST_NOTIFICATIONS, so a device that cannot show a notification can still be woken and can
+  // still acknowledge delivery. Gating registration on permission meant a recipient with
+  // notifications switched off left every sender on one grey tick forever — a far worse
+  // outcome, and one the user could not connect to a setting they had changed.
+  if (status.phase === 'unsupported') return;
 
   if (status.token === null) {
     const token = await nativePush.getToken();
@@ -382,10 +401,12 @@ export function initPush(): Promise<void> {
       await drainPendingEvents();
       await refreshPermission();
       if (status.permission !== 'granted') {
+        // Register anyway — see `syncRegistration`. `pushAvailable` still stays false, so the
+        // SyncEngine keeps its socket; what we gain is a device that can be woken and can
+        // acknowledge delivery even though it will not display anything.
         log.info(
-          'push: notification permission not granted — push unavailable',
+          'push: notifications not permitted — registering for wake-only',
         );
-        return;
       }
       await syncRegistration();
     } catch (err) {
