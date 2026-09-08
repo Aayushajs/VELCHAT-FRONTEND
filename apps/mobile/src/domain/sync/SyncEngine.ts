@@ -196,7 +196,8 @@ class SyncEngine {
    * otherwise sit in the chat list showing a raw UUID until the next cold start.
    */
   private displayNameResolver:
-    ((accountId: string) => Promise<string | undefined>) | null = null;
+    | ((accountId: string) => Promise<string | undefined>)
+    | null = null;
   /** Account ids we already tried to name — one attempt each, never a retry loop per message. */
   private readonly namedPeers = new Set<string>();
   // Ephemeral realtime (§C4/§A15) — NEVER persisted. One owned expiry timer per typing
@@ -657,7 +658,14 @@ class SyncEngine {
    */
   private async resyncAll(): Promise<void> {
     if (this.stopped) return;
-    this.setConnState('syncing');
+    // Only CLAIM to be syncing when this is a post-connect catch-up.
+    //
+    // `resyncNow()` (the push path) can run with no socket at all, and this method only restored
+    // the state to `live` when one existed — so a push-triggered catch-up left the UI stuck on
+    // "syncing" indefinitely, describing work nobody was waiting on. A background catch-up should
+    // be silent; the banner belongs to the socket's own lifecycle.
+    const announce = this.socket !== null;
+    if (announce) this.setConnState('syncing');
     let ids: string[] = [];
     try {
       ids = await listConversationIds();
@@ -679,7 +687,9 @@ class SyncEngine {
     // user can see. Holding `syncing` until the whole history is walked describes work nobody is
     // waiting on and reads as a hang.
     this.flushReceipts();
-    if (!this.stopped && this.socket) this.setConnState('live');
+    // Not `announce &&` alone: if the socket died mid-catch-up, `onSocketClose` has already
+    // published the truthful state and overwriting it with `live` would be a lie.
+    if (announce && !this.stopped && this.socket) this.setConnState('live');
 
     if (rest.length > 0) {
       // Deliberately not awaited: the remainder converges in the background.
@@ -1179,16 +1189,16 @@ class SyncEngine {
       typeof d.conversationId === 'string'
         ? d.conversationId
         : typeof d.conversation_id === 'string'
-          ? d.conversation_id
-          : undefined;
+        ? d.conversation_id
+        : undefined;
     const userId =
       typeof d.userId === 'string'
         ? d.userId
         : typeof d.user_id === 'string'
-          ? d.user_id
-          : typeof d.account_id === 'string'
-            ? d.account_id
-            : undefined;
+        ? d.user_id
+        : typeof d.account_id === 'string'
+        ? d.account_id
+        : undefined;
     if (conversationId === undefined || userId === undefined) return;
     if (state === 'stop') {
       this.clearTyping(conversationId);
@@ -1339,7 +1349,7 @@ class SyncEngine {
       try {
         const members = await getConversationMembers(conversationId);
         const others = members.filter(m => m !== me);
-        peerId = others.length === 1 ? (others[0] ?? null) : null;
+        peerId = others.length === 1 ? others[0] ?? null : null;
       } catch (e) {
         log.warn('presence members resolve failed', { reason: String(e) });
         return null;

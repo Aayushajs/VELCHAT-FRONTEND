@@ -34,6 +34,7 @@ import {
   syncConversationNames,
   syncPersonNames,
   observeConversations,
+  subscribeSession,
   type PushPendingEvent,
 } from '../../../infra';
 import { syncEngine } from '../../../domain/sync';
@@ -45,6 +46,7 @@ const NAME_MIRROR_LIMIT = 200;
 let unsubEvents: (() => void) | null = null;
 let unsubAvailability: (() => void) | null = null;
 let unsubMessages: (() => void) | null = null;
+let unsubSession: (() => void) | null = null;
 let namesSub: { unsubscribe: () => void } | null = null;
 
 /**
@@ -109,6 +111,16 @@ export function startPushRuntime(): void {
 
   startNameMirror();
   void initPush();
+
+  // Re-register push when the user signs in while the app is already running.
+  // initPush() runs once at mount, but if no session exists yet (fresh install / after
+  // sign-out) it defers registration. This listener fills that gap — identical to how
+  // the SyncEngine re-opens its socket on session establishment (§L6).
+  if (!unsubSession) {
+    unsubSession = subscribeSession(present => {
+      if (present) void initPush();
+    });
+  }
 }
 
 /** §M7: release everything this module owns. */
@@ -116,10 +128,12 @@ export function stopPushRuntime(): void {
   unsubEvents?.();
   unsubAvailability?.();
   unsubMessages?.();
+  unsubSession?.();
   namesSub?.unsubscribe();
   unsubEvents = null;
   unsubAvailability = null;
   unsubMessages = null;
+  unsubSession = null;
   namesSub = null;
 }
 

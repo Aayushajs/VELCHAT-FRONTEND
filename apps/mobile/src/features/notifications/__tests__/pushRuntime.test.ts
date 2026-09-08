@@ -46,6 +46,7 @@ jest.mock('../../../infra', () => ({
     return () => undefined;
   },
   subscribePushMessages: () => () => undefined,
+  subscribeSession: () => () => undefined,
   drainPendingEvents: async () => {
     // Mirrors the real contract: the queue is emptied by the read, and every listener in this
     // context receives the batch.

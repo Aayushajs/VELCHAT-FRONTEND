@@ -43,13 +43,67 @@ apply from: project(':react-native-config').projectDir.getPath() + "/dotenv.grad
 // One flavor per Gradle invocation, same as the ENVFILE rule documented above: the flavor is
 // read from the task names, so `assembleDevRelease assembleProdRelease` in one call would
 // resolve a single config for both. Build them separately.
+def velchatFlavorNames = ["stage", "prod", "dev"]
+
+/**
+ * Which flavor is this invocation building, and REFUSE to guess when the answer is ambiguous.
+ *
+ * The comment above has warned about this for months and it happened anyway: a single
+ * `assembleDevRelease assembleProdRelease` bakes ONE env file into BOTH APKs, so the artifact
+ * named `app-prod-release.apk` silently pointed at the Render dev backend. It installs, it
+ * launches, it logs in — and then messages do not send and no push arrives, because it is
+ * talking to a different (and much older) server than its name claims. Nothing in the build
+ * output says so; you have to unzip the APK to find out.
+ *
+ * A comment cannot prevent that. Failing the build can. `env`/`google-services.json` are chosen
+ * per INVOCATION by `dotenv.gradle`, so an invocation that would produce APKs for more than one
+ * flavor — or for all of them, via a flavor-less `assembleRelease` — cannot be served correctly
+ * and is rejected instead of quietly mislabelled.
+ *
+ * Only artifact-producing tasks are checked. `compileProdDebugKotlin`, `test`, `lint` and the
+ * like are unaffected.
+ */
 def velchatBuildFlavor = {
-    def names = (gradle.startParameter.taskNames ?: []).join(" ").toLowerCase()
-    // Longest first so "stage" is not shadowed by a substring match elsewhere.
-    for (candidate in ["stage", "prod", "dev"]) {
-        if (names.contains(candidate)) return candidate
+    // Original casing is kept for the messages: Gradle task names are case-sensitive, so a
+    // lowercased "assembleprodrelease" in the suggested fix would not run.
+    def taskNames = (gradle.startParameter.taskNames ?: []) as List<String>
+
+    def flavorOf = { String task ->
+        def lower = task.toLowerCase()
+        // Longest first so "stage" is not shadowed by a substring match.
+        velchatFlavorNames.find { lower.contains(it) }
     }
-    return null
+
+    def artifactTasks = taskNames.findAll { it.toLowerCase() =~ /(assemble|bundle|install)/ }
+    if (!artifactTasks.isEmpty()) {
+        def unscoped = artifactTasks.findAll { flavorOf(it) == null }
+        if (unscoped) {
+            throw new GradleException("""
+VelChat: ${unscoped} would build EVERY flavor, and react-native-config applies only ONE
+.env per invocation - the other flavors would be baked with the wrong API_BASE_URL.
+Name the flavor instead, e.g.:
+    ENVFILE=.env.prod ./gradlew assembleProdRelease
+""")
+        }
+        def flavors = artifactTasks.collect { flavorOf(it) }.unique()
+        if (flavors.size() > 1) {
+            def lines = flavors.collect { f ->
+                "    ENVFILE=.env.${f} ./gradlew " + artifactTasks.find { t -> flavorOf(t) == f }
+            }
+            throw new GradleException("""
+VelChat: refusing to build ${flavors} in one invocation.
+react-native-config applies ONE .env to every variant per invocation, so the extra flavors
+would be baked with another flavor's API_BASE_URL - i.e. an APK named "prod" that quietly
+talks to the dev backend. Messages do not send, push never arrives, and nothing in the build
+output says why.
+Run them separately:
+${lines.join(System.lineSeparator())}
+""")
+        }
+    }
+
+    // No artifact task (or a single well-scoped one): best-effort detection is fine.
+    return taskNames.collect { flavorOf(it) }.find { it != null }
 }()
 
 def velchatFirebaseConfig = {
