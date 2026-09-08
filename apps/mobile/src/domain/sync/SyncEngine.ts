@@ -17,18 +17,25 @@ import {
   useRealtimeStore,
   normalizePresenceStatus,
   TYPING_TTL_MS,
+  recordLatency,
+  logLatencySnapshot,
 } from '../../core';
 import type { ConnectionState } from '../../core';
 import {
   RealtimeSocket,
   WS_CODE_UNAUTHORIZED,
   hasSession,
+  subscribeSession,
   getAccessToken,
   refreshAccessToken,
   getAccountId,
+  getDeviceId,
   getConversationMembers,
   getPresence,
   subscribePresence,
+  presenceOnline,
+  presenceOffline,
+  presenceHeartbeat,
   normalizePresenceEvent,
   subscribeNetwork,
   getNetworkStatus,
@@ -45,6 +52,7 @@ import {
   maxSeqForConversation,
   minSeqForConversation,
   applyReceipt,
+  parseReceiptFrame,
   enqueueOptimisticSend,
   claimNextDue,
   markAckd,
@@ -68,6 +76,7 @@ import {
   notePeerWatermark,
   markDirty,
   takeDirty,
+  reassertReceipts,
 } from '../../infra';
 
 /** Lower/upper bounds for the outbox self-adjusting timer (never poll a hot loop). */
@@ -90,6 +99,13 @@ const RECEIPT_FLUSH_DELAY_MS = 250;
  * "syncing" for minutes; unbounded fan-out is a self-inflicted burst against the edge limiter.
  */
 const RESYNC_CONCURRENCY = 4;
+/**
+ * Conversations whose catch-up the user actually waits on. `syncing` should describe the chat in
+ * front of them, not a walk of their entire history: with a few hundred conversations the banner
+ * otherwise sits there through hundreds of round-trips while the app is already perfectly usable.
+ * The rest continue quietly afterwards — the same work, just not presented as a wait.
+ */
+const PRIORITY_SYNC_COUNT = 8;
 /** Matches the server's hard clamp — a full page means "there is more", so keep paging. */
 const BACKFILL_PAGE = 100;
 /** Safety stop for the paging loop: 100 pages = 10k messages in one conversation, per resync. */
@@ -101,15 +117,36 @@ const MAX_BACKFILL_PAGES = 100;
  * that a phone in a pocket is never holding a socket open.
  */
 const BACKGROUND_SUSPEND_DELAY_MS = 30_000;
+/**
+ * How often we refresh our OWN presence server-side. Must be comfortably inside the server's
+ * `PRESENCE_ONLINE_TTL_MS` (30 s) `online:{userId}` TTL or we flicker offline while still connected; 20 s leaves room for
+ * one lost request. The realtime gateway never reports our socket to the presence service (its
+ * `ping` refreshes only its own connection registry), so if the client doesn't do this, nobody
+ * does — which is why every peer appeared offline regardless of what they were doing.
+ */
+const PRESENCE_HEARTBEAT_MS = 20_000;
+/**
+ * How often the OPEN chat re-reads its peer's presence. The gateway fans no `presence.changed`
+ * frame to sockets, so there is no push to wait for: a one-shot read at chat-open was simply a
+ * snapshot that went stale seconds later and never recovered. Also re-subscribes, since the
+ * server's `subscribers:{u}` set expires after 300 s.
+ */
+const PEER_PRESENCE_POLL_MS = 20_000;
 
 class SyncEngine {
   private socket: RealtimeSocket | null = null;
   private netUnsub: (() => void) | null = null;
   private appStateUnsub: (() => void) | null = null;
+  private sessionUnsub: (() => void) | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private outboxTimer: ReturnType<typeof setTimeout> | null = null;
   private receiptTimer: ReturnType<typeof setTimeout> | null = null;
   private suspendTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Owned timers for the presence pair: our own keepalive, and the open chat's peer refresh. */
+  private presenceTimer: ReturnType<typeof setInterval> | null = null;
+  private peerPresenceTimer: ReturnType<typeof setInterval> | null = null;
+  /** True once we have told the server this device is online (so we only say "offline" if so). */
+  private presenceAnnounced = false;
   /** True while the app is backgrounded and the socket has been deliberately released. */
   private suspended = false;
   /**
@@ -135,18 +172,32 @@ class SyncEngine {
   /** Set when the server rate-limits a send; no drain runs before it expires. */
   private outboxCooldownUntil = 0;
   /**
+   * When realtime last went down. The gap until the next successful open is how long the user was
+   * actually cut off — the number that decides whether a flaky link is survivable, and one no unit
+   * test can observe.
+   */
+  private lastCloseAt: number | null = null;
+  /**
    * Per conversation, the cursor a gap-probe last ran from. Deleted messages leave a permanent,
    * legitimate hole in `seq`, so a probe that comes back empty must not be repeated on every
    * later message — only a cursor that actually moved earns another.
    */
   private readonly gapProbedFrom = new Map<string, number>();
   /**
+   * In-flight "load older" per conversation. Two callers that both read the cursor before either
+   * writes will fetch the SAME page and insert it twice: the dedup in `applyServerMessages`
+   * decides from a read taken before its write, so concurrent applies each conclude the rows are
+   * new. A double-tap at the top of a chat is enough to produce it.
+   */
+  private readonly loadingOlder = new Map<string, Promise<boolean>>();
+  /**
    * Resolves an account id to a display name. INJECTED by the feature layer (§M3: domain must
    * not import features), because a brand-new DM arrives as a bare account id and would
    * otherwise sit in the chat list showing a raw UUID until the next cold start.
    */
   private displayNameResolver:
-    ((accountId: string) => Promise<string | undefined>) | null = null;
+    | ((accountId: string) => Promise<string | undefined>)
+    | null = null;
   /** Account ids we already tried to name — one attempt each, never a retry loop per message. */
   private readonly namedPeers = new Set<string>();
   // Ephemeral realtime (§C4/§A15) — NEVER persisted. One owned expiry timer per typing
@@ -159,6 +210,8 @@ class SyncEngine {
   // One-shot crash-recovery: resets outbox rows orphaned in `sending` by a prior kill.
   // The first drain awaits it so it can't claim behind a stuck row.
   private recovery: Promise<unknown> | null = null;
+  /** Single-flight for `resyncNow()` — see the note there. */
+  private pushResync: Promise<void> | null = null;
 
   /**
    * Declare that push can wake the app. Until this is true the engine keeps its socket while
@@ -218,6 +271,19 @@ class SyncEngine {
       log.warn('outbox recovery failed', { reason: String(e) });
     });
     this.netUnsub = subscribeNetwork(s => this.onNetwork(s.connected));
+    // A sign-in that happens while the app is ALREADY RUNNING is the case this engine could
+    // not previously see: `connect()` refuses to open a socket without a session, and it only
+    // re-arms on a network/foreground transition — neither of which a login causes. So the
+    // socket stayed shut for the rest of the run and the user received nothing (no messages,
+    // no receipts → no ticks, no presence) until they force-quit. Now the session itself tells us.
+    this.sessionUnsub = subscribeSession(present => {
+      if (this.stopped) return;
+      if (present) {
+        this.onSessionEstablished();
+      } else {
+        this.onSessionCleared();
+      }
+    });
     // §8 addendum: detect background→foreground transitions. If the socket died silently
     // while backgrounded (common on iOS), NetInfo doesn't fire — this catches it.
     this.appStateUnsub = subscribeAppState(s => {
@@ -226,6 +292,10 @@ class SyncEngine {
         this.suspended = false;
         this.onForeground();
       } else {
+        // Backgrounding is the natural reporting boundary: a session's numbers, emitted once,
+        // where they cost nothing. This must NOT live inside the suspend timer — that is gated
+        // on push being available, so the snapshot would never fire while push is missing.
+        logLatencySnapshot();
         this.scheduleSuspend();
       }
     });
@@ -238,6 +308,12 @@ class SyncEngine {
   stop(): void {
     this.stopped = true;
     this.started = false;
+    // Forget the connectivity of the session that just ended. `connect()` only fires on a
+    // TRANSITION to online, and `start()` seeds that from a fresh NetInfo read — so a remembered
+    // `true` makes the seed look like "no change" and the next session runs with NO socket at all:
+    // no inbound messages, no ticks, no presence, until the app is force-quit. `stopSync`/
+    // `startSync` bracket the authenticated session, so this is precisely the sign-out → sign-in path.
+    this.online = false;
     if (this.netUnsub) {
       this.netUnsub();
       this.netUnsub = null;
@@ -246,16 +322,26 @@ class SyncEngine {
       this.appStateUnsub();
       this.appStateUnsub = null;
     }
+    if (this.sessionUnsub) {
+      this.sessionUnsub();
+      this.sessionUnsub = null;
+    }
     this.clearReconnectTimer();
     this.clearOutboxTimer();
     this.clearReceiptTimer();
     this.clearSuspendTimer();
+    this.clearPeerPresenceTimer();
+    this.stopSelfPresence();
     this.suspended = false;
     this.clearAllTyping();
     this.activeConversationId = null;
     this.gapProbedFrom.clear();
+    this.loadingOlder.clear();
     this.namedPeers.clear();
     this.activePresencePeers.clear();
+    // Not awaited, but it must not be remembered: a resync in flight when the session ends would
+    // otherwise make the NEXT session's first `resyncNow()` a no-op returning the old promise.
+    this.pushResync = null;
     useRealtimeStore.getState().reset();
     const s = this.socket;
     this.socket = null;
@@ -280,6 +366,8 @@ class SyncEngine {
       this.socket = null;
       s?.close();
       this.clearOutboxTimer();
+      this.clearPeerPresenceTimer();
+      this.stopSelfPresence();
     }
   }
 
@@ -298,6 +386,43 @@ class SyncEngine {
     this.kickOutbox();
   }
 
+  /**
+   * The user just signed in (in-session), so everything that was gated on "no session" can now
+   * run. Reset the backoff/refresh budgets first: attempts accumulated while signed out say
+   * nothing about this fresh, known-good token, and leaving them set would delay the first
+   * connect by the tail of an old backoff.
+   */
+  private onSessionEstablished(): void {
+    log.info('session established: connecting realtime');
+    this.reconnectAttempts = 0;
+    this.authRefreshAttempts = 0;
+    this.clearReconnectTimer();
+    this.connect();
+    this.kickOutbox();
+  }
+
+  /**
+   * Signed out (or the session was revoked). Drop the socket rather than let it keep running on
+   * a token that is gone — the gateway would close it as 4001 anyway, and the recovery path
+   * would then burn its refresh budget trying to revive a session that no longer exists.
+   */
+  private onSessionCleared(): void {
+    log.info('session cleared: releasing realtime');
+    this.clearReconnectTimer();
+    this.clearAllTyping();
+    this.clearPeerPresenceTimer();
+    // Announce offline BEFORE the token disappears — afterwards the request would 401.
+    this.stopSelfPresence();
+    this.activeConversationId = null;
+    this.gapProbedFrom.clear();
+    this.namedPeers.clear();
+    this.activePresencePeers.clear();
+    const s = this.socket;
+    this.socket = null;
+    s?.close();
+    this.setConnState('disconnected');
+  }
+
   // ── socket lifecycle ─────────────────────────────────────────────────────
   private connect(): void {
     if (this.stopped) return;
@@ -310,13 +435,25 @@ class SyncEngine {
     this.setConnState('connecting');
     const socket = new RealtimeSocket({
       onOpen: () => {
+        if (this.lastCloseAt !== null) {
+          recordLatency('ws.reconnect', Date.now() - this.lastCloseAt);
+          this.lastCloseAt = null;
+        }
         this.reconnectAttempts = 0;
         // The token is proven good — re-arm the 4001 refresh budget for the next expiry.
         this.authRefreshAttempts = 0;
         this.setConnState('connected');
+        // An open socket IS this device being online — and the ONLY thing that can tell the
+        // presence service so, because the gateway never reports it (see infra/network/presence).
+        this.startSelfPresence();
         log.info('ws open');
       },
       onConnected: () => {
+        // A frame we handed to a dead or misbehaving link was recorded as sent even though the
+        // peer never saw it — which is how a tick gets stuck on one tick permanently, since the
+        // only client that could correct it believes the work is done. A reconnect is exactly when
+        // that belief is worthless, so re-announce what we want the peer to know.
+        for (const id of reassertReceipts()) markDirty(id);
         // Re-emit anything the peer still doesn't know BEFORE the catch-up: receipts owed from
         // before the drop are the ones most likely to be showing a stale tick right now.
         this.flushReceipts();
@@ -347,9 +484,15 @@ class SyncEngine {
   }
 
   private onSocketClose(code: number, reason: string): void {
+    // Only the FIRST close of an outage starts the clock; retries that fail to open must not
+    // reset it, or a long outage would be reported as a series of short ones.
+    if (this.lastCloseAt === null) this.lastCloseAt = Date.now();
     this.socket = null;
     // Peers' "typing" is no longer trustworthy once the link drops — clear all indicators.
     this.clearAllTyping();
+    // The link is gone, so this device is no longer reachable: say so rather than let the TTL
+    // expire silently (which would leave the peer's "last seen" up to 30s wrong).
+    this.stopSelfPresence();
     log.info('ws closed', { code, reason });
     if (this.stopped) return;
     if (code === WS_CODE_UNAUTHORIZED) {
@@ -444,6 +587,10 @@ class SyncEngine {
       this.clearOutboxTimer();
       this.clearReceiptTimer();
       this.clearAllTyping();
+      this.clearPeerPresenceTimer();
+      // Backgrounded with the socket released = offline to everyone else. Announce it so the
+      // peer sees a real "last seen" instead of a user who never goes away.
+      this.stopSelfPresence();
       const s = this.socket;
       this.socket = null;
       s?.close();
@@ -474,6 +621,28 @@ class SyncEngine {
 
   // ── catch-up (reconnect backfill) ────────────────────────────────────────
   /**
+   * Catch up now, on demand — the push layer's entry point (§M13 "push → bounded sync → sleep").
+   *
+   * Single-flighted against itself, because the two callers can easily coincide: a data push
+   * arriving while JS is alive, and FCM reporting that it DROPPED messages for this device. Two
+   * concurrent walks would double every backfill request for no gain.
+   *
+   * Deliberately reuses the reconnect path rather than fetching the pushed message by id: a push
+   * is a hint, not a delivery, and the cursor sync is what makes "we have everything up to N"
+   * true even when several pushes were coalesced or dropped (§G4).
+   */
+  async resyncNow(): Promise<void> {
+    if (this.stopped) return;
+    if (this.pushResync) return this.pushResync;
+    this.pushResync = this.resyncAll()
+      .catch(() => undefined)
+      .finally(() => {
+        this.pushResync = null;
+      });
+    return this.pushResync;
+  }
+
+  /**
    * Catch up every conversation after a reconnect. Four properties are deliberate:
    *
    *  - The conversation on screen goes FIRST. Everything else can settle in the background; the
@@ -489,7 +658,14 @@ class SyncEngine {
    */
   private async resyncAll(): Promise<void> {
     if (this.stopped) return;
-    this.setConnState('syncing');
+    // Only CLAIM to be syncing when this is a post-connect catch-up.
+    //
+    // `resyncNow()` (the push path) can run with no socket at all, and this method only restored
+    // the state to `live` when one existed — so a push-triggered catch-up left the UI stuck on
+    // "syncing" indefinitely, describing work nobody was waiting on. A background catch-up should
+    // be silent; the banner belongs to the socket's own lifecycle.
+    const announce = this.socket !== null;
+    if (announce) this.setConnState('syncing');
     let ids: string[] = [];
     try {
       ids = await listConversationIds();
@@ -501,6 +677,33 @@ class SyncEngine {
       ids = [active, ...ids.filter(id => id !== active)];
     }
 
+    // The conversation on screen plus the most recent handful — everything a user could be
+    // looking at right now. `ids` is already most-recent-first.
+    const priority = ids.slice(0, PRIORITY_SYNC_COUNT);
+    const rest = ids.slice(PRIORITY_SYNC_COUNT);
+
+    await this.backfillMany(priority);
+    // Receipts owed for what just landed, then report live: the app IS current for everything the
+    // user can see. Holding `syncing` until the whole history is walked describes work nobody is
+    // waiting on and reads as a hang.
+    this.flushReceipts();
+    // Not `announce &&` alone: if the socket died mid-catch-up, `onSocketClose` has already
+    // published the truthful state and overwriting it with `live` would be a lie.
+    if (announce && !this.stopped && this.socket) this.setConnState('live');
+
+    if (rest.length > 0) {
+      // Deliberately not awaited: the remainder converges in the background.
+      void this.backfillMany(rest)
+        .then(() => {
+          this.flushReceipts();
+        })
+        .catch(() => undefined);
+    }
+  }
+
+  /** Backfill a set of conversations with bounded concurrency. */
+  private async backfillMany(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
     let next = 0;
     const worker = async (): Promise<void> => {
       for (;;) {
@@ -519,10 +722,6 @@ class SyncEngine {
     await Promise.all(
       Array.from({ length: Math.min(RESYNC_CONCURRENCY, ids.length) }, worker),
     );
-
-    // Anything the catch-up marked delivered goes out as one cumulative frame per conversation.
-    this.flushReceipts();
-    if (!this.stopped && this.socket) this.setConnState('live');
   }
 
   /**
@@ -646,6 +845,21 @@ class SyncEngine {
   }
 
   /**
+   * Acknowledge inbound messages that some OTHER path restored (the inbox backfill at launch /
+   * after sign-in), so the sender's second tick appears.
+   *
+   * Needed because the engine's own catch-up asks only for messages past the local cursor: once
+   * `backfillInbox` has pulled a conversation's history, `backfillConversation` gets an empty
+   * page and its `noteDelivered` never runs. Messages that arrived while the user was signed out
+   * therefore sat on the recipient's device fully delivered while the sender kept one grey tick
+   * with nothing that could ever repair it. Cumulative + monotonic, so a duplicate call is free.
+   */
+  noteInboundDelivered(conversationId: string, seq: number): void {
+    if (!(seq > 0)) return;
+    this.noteDelivered(conversationId, seq);
+  }
+
+  /**
    * The chat screen tells the engine which conversation is on screen. While a conversation is
    * active, every message that lands in it is read on arrival: the badge never climbs on a chat
    * the user is looking at, and the sender sees blue ticks without the reader touching anything.
@@ -656,6 +870,7 @@ class SyncEngine {
 
   // ── inbound frames ───────────────────────────────────────────────────────
   private async onInboundMessage(data: unknown): Promise<void> {
+    const arrivedAt = Date.now();
     const m = normalizeServerMessage(data);
     if (!m) return;
     // A new message from the peer means they've stopped typing — clear the indicator (§C4).
@@ -703,19 +918,26 @@ class SyncEngine {
           });
         }
       }
+      // Frame → row on screen. This is the "did it arrive?" feeling, and the only place the
+      // receive path can be judged without a device in hand.
+      recordLatency('recv.apply', Date.now() - arrivedAt);
       if (m.senderId !== getAccountId()) {
         void this.nameStubConversation(m.conversationId, m.senderId);
         this.noteDelivered(m.conversationId, m.seq);
-        // Landed in the chat the user is currently reading → it is read, now. Clearing the badge
-        // here is what stops it from climbing on the open conversation, and the read watermark is
-        // what turns the sender's ticks blue while they watch.
-        if (this.activeConversationId === m.conversationId) {
-          this.noteRead(m.conversationId, m.seq);
-          try {
-            await clearUnread(m.conversationId);
-          } catch {
-            // badge cosmetics only — never fail the inbound path over it
-          }
+      }
+      // A message that lands in the conversation ON SCREEN has been seen — whoever sent it.
+      //
+      // This deliberately sits OUTSIDE the "from someone else" guard. In a chat with yourself
+      // every message is your own, so gating the read on a foreign sender meant the watermark
+      // never advanced while the chat was open: the tick stayed on sent until you left and came
+      // back, where the mount-time read finally reported it. Reading a chat you are looking at is
+      // true regardless of who wrote the message.
+      if (this.activeConversationId === m.conversationId) {
+        this.noteRead(m.conversationId, m.seq);
+        try {
+          await clearUnread(m.conversationId);
+        } catch {
+          // badge cosmetics only — never fail the inbound path over it
         }
       }
     } catch (e) {
@@ -724,29 +946,22 @@ class SyncEngine {
   }
 
   private async onInboundReceipt(data: unknown): Promise<void> {
-    const d =
-      data && typeof data === 'object' ? (data as Record<string, unknown>) : {};
-    const conversationId =
-      typeof d.conversationId === 'string'
-        ? d.conversationId
-        : typeof d.conversation_id === 'string'
-          ? d.conversation_id
-          : undefined;
-    const seqRaw = d.upToSeq ?? d.up_to_seq ?? d.seq;
-    const upToSeq = typeof seqRaw === 'number' ? seqRaw : Number(seqRaw);
-    const state =
-      d.state === 'read'
-        ? 'read'
-        : d.state === 'delivered'
-          ? 'delivered'
-          : undefined;
-    if (
-      conversationId === undefined ||
-      !Number.isFinite(upToSeq) ||
-      state === undefined
-    ) {
-      return;
-    }
+    // Parsing + the self-echo filter are pure and unit-tested (`parseReceiptFrame`). The
+    // gateway fans a receipt to EVERY member including the acknowledger, so without that
+    // filter our own `read` — emitted the instant we open a chat — came back and turned our
+    // OWN bubbles blue, making the ticks describe us rather than the peer.
+    // Parse WITHOUT the self-echo rule first, so we know which conversation this is about, then
+    // apply the rule with that context: in a chat whose only member is us, our own receipt is the
+    // only one that will ever arrive and must NOT be discarded.
+    const me = getAccountId();
+    const preview = parseReceiptFrame(data, undefined);
+    if (!preview) return;
+    const selfChat =
+      me !== undefined &&
+      (await peerIdFor(preview.conversationId).catch(() => undefined)) === me;
+    const r = parseReceiptFrame(data, me, { selfChat });
+    if (!r) return;
+    const { conversationId, upToSeq, state } = r;
     // Remember it even if it matches nothing right now: a receipt for messages we have not
     // backfilled yet used to evaporate, leaving permanent grey ticks on messages the peer had
     // already read. The backfill re-applies this watermark once those rows exist.
@@ -764,14 +979,37 @@ class SyncEngine {
     void this.drainOutbox();
   }
 
-  private async drainOutbox(): Promise<void> {
+  /**
+   * Transmit the outbox once, WITHOUT the engine running and without a socket — the headless
+   * push wake (§M13 "push → bounded work → sleep").
+   *
+   * A reply typed into a notification writes its bubble and its outbox row like any other send,
+   * but `kickOutbox` is gated on a started, online engine, and in a headless JS context neither
+   * is true: `stopped` is still its initial `true` and `online` has never been seeded from
+   * NetInfo. So the message would sit in the queue until the user next opened the app, which is
+   * precisely the wait replying from the notification is supposed to avoid.
+   *
+   * Sending is plain REST (`sendChatMessage`) and stays valid without a socket, so lifting the
+   * lifecycle gate here costs nothing and changes no behaviour for the running engine: if it is
+   * live and already draining, the `draining` guard makes this a no-op.
+   */
+  async flushOutboxNow(): Promise<void> {
+    await this.drainOutbox({ ignoreLifecycle: true });
+  }
+
+  private async drainOutbox(
+    opts: { ignoreLifecycle?: boolean } = {},
+  ): Promise<void> {
     if (this.draining) return;
     this.draining = true;
     try {
       // Never claim before crash-recovery has un-stuck orphaned `sending` rows.
       if (this.recovery) await this.recovery;
       for (;;) {
-        if (this.stopped || !this.online || !hasSession()) break;
+        // `hasSession()` is checked either way: without tokens there is nothing to send, and no
+        // caller may bypass that.
+        if (!hasSession()) break;
+        if (!opts.ignoreLifecycle && (this.stopped || !this.online)) break;
         // Rate limited a moment ago — walking the queue now just re-earns the 429 and burns an
         // attempt on every message behind it.
         if (Date.now() < this.outboxCooldownUntil) break;
@@ -781,6 +1019,17 @@ class SyncEngine {
           const ack = await sendChatMessage(item.input);
           await markMessageSent(item.clientMsgId, ack);
           await markAckd(item.id);
+          // The peer may have acknowledged this message BEFORE our own ack came back — the
+          // fan-out reaches them while our HTTP response is still in flight, so their `delivered`
+          // routinely wins the race. Applied then it matched nothing, because the row had no seq
+          // yet and `applyReceipt` selects on seq. Now that it has one, re-apply what the peer
+          // already told us; without this the message keeps a single tick for good, however long
+          // ago it was delivered.
+          await this.applyPeerWatermark(item.conversationId);
+          // From when the user composed it, not from when this attempt started: a message that
+          // sat in the queue through three failures took that long to be delivered, and pretending
+          // otherwise would make a bad network look fast.
+          recordLatency('send.ack', Date.now() - item.createdAt);
         } catch (e) {
           const attempts = item.attempts + 1;
           const msg = isAppError(e) ? e.message : String(e);
@@ -845,12 +1094,16 @@ class SyncEngine {
   ): Promise<void> {
     // ONE transaction for the bubble + its outbox row: a crash between two writes used to strand
     // a message in `sending` that nothing would ever transmit or surface as failed.
+    const t0 = Date.now();
     const clientMsgId = await enqueueOptimisticSend(
       conversationId,
       text,
       senderId,
     );
     if (!clientMsgId) return;
+    // The budget that decides whether sending FEELS instant (§L7: ≤20 ms p50). Measured here
+    // because this is the moment the bubble becomes visible — everything after is background.
+    recordLatency('send.local', Date.now() - t0);
     this.kickOutbox();
   }
 
@@ -862,6 +1115,20 @@ class SyncEngine {
    * whether anything new landed, so the UI only grows its window when there is more to show.
    */
   async loadOlderMessages(
+    conversationId: string,
+    page: number,
+  ): Promise<boolean> {
+    // Concurrent callers share ONE fetch — see `loadingOlder`.
+    const inFlight = this.loadingOlder.get(conversationId);
+    if (inFlight) return inFlight;
+    const work = this.fetchOlderMessages(conversationId, page).finally(() => {
+      this.loadingOlder.delete(conversationId);
+    });
+    this.loadingOlder.set(conversationId, work);
+    return work;
+  }
+
+  private async fetchOlderMessages(
     conversationId: string,
     page: number,
   ): Promise<boolean> {
@@ -922,16 +1189,16 @@ class SyncEngine {
       typeof d.conversationId === 'string'
         ? d.conversationId
         : typeof d.conversation_id === 'string'
-          ? d.conversation_id
-          : undefined;
+        ? d.conversation_id
+        : undefined;
     const userId =
       typeof d.userId === 'string'
         ? d.userId
         : typeof d.user_id === 'string'
-          ? d.user_id
-          : typeof d.account_id === 'string'
-            ? d.account_id
-            : undefined;
+        ? d.user_id
+        : typeof d.account_id === 'string'
+        ? d.account_id
+        : undefined;
     if (conversationId === undefined || userId === undefined) return;
     if (state === 'stop') {
       this.clearTyping(conversationId);
@@ -972,6 +1239,97 @@ class SyncEngine {
 
   // ── presence (§A15) ────────────────────────────────────────────────────────
   /**
+   * Tell the presence service this device is online and keep saying so.
+   *
+   * The realtime gateway is documented as the caller of `POST /presence/online` but never wires a
+   * presence client, and its inbound `ping` refreshes only its own connection registry — so
+   * before this, `online:{userId}` was never populated for ANY account and every peer read as
+   * offline no matter what they were doing. Idempotent: re-announcing is harmless (`SADD`).
+   */
+  private startSelfPresence(): void {
+    const me = getAccountId();
+    const device = getDeviceId();
+    if (!me || !device) return;
+    this.clearPresenceTimer();
+    this.presenceAnnounced = true;
+    void presenceOnline(me, device).catch((e: unknown) => {
+      log.warn('presence online failed', { reason: String(e) });
+    });
+    // Owned interval (§M7): refreshes inside the server's 30s TTL, disposed with the socket.
+    this.presenceTimer = setInterval(() => {
+      const uid = getAccountId();
+      if (!uid) return;
+      void presenceHeartbeat(uid).catch(() => undefined);
+    }, PRESENCE_HEARTBEAT_MS);
+  }
+
+  /**
+   * Tell the presence service this device is gone, and stop the keepalive. Called on every path
+   * that releases the socket (close, background suspend, sign-out, engine stop) so the peer sees
+   * an accurate "last seen" instead of a user who is online forever.
+   */
+  private stopSelfPresence(): void {
+    this.clearPresenceTimer();
+    if (!this.presenceAnnounced) return;
+    this.presenceAnnounced = false;
+    const me = getAccountId();
+    const device = getDeviceId();
+    if (!me || !device) return;
+    void presenceOffline(me, device).catch(() => undefined);
+  }
+
+  private clearPresenceTimer(): void {
+    if (this.presenceTimer !== null) {
+      clearInterval(this.presenceTimer);
+      this.presenceTimer = null;
+    }
+  }
+
+  private clearPeerPresenceTimer(): void {
+    if (this.peerPresenceTimer !== null) {
+      clearInterval(this.peerPresenceTimer);
+      this.peerPresenceTimer = null;
+    }
+  }
+
+  /** Read one peer's presence snapshot into the live store. Best-effort, never throws. */
+  private async refreshPeerPresence(peerId: string): Promise<void> {
+    const me = getAccountId();
+    if (!me) return;
+    try {
+      const p = await getPresence(peerId, me);
+      useRealtimeStore.getState().setPresence(peerId, {
+        status: normalizePresenceStatus(p.status),
+        lastSeen: p.lastSeen,
+      });
+    } catch (e) {
+      log.warn('presence fetch failed', { reason: String(e) });
+    }
+  }
+
+  /**
+   * Keep the OPEN chat's peer presence current. There is no `presence.changed` frame to wait for
+   * (the gateway's fan-out subscribes to message/receipt/caption only), so the snapshot has to be
+   * re-read: without this, a peer who came online AFTER the chat was opened stayed grey forever,
+   * and one who left stayed "online" forever. Re-subscribes each tick too, because the server's
+   * `subscribers:{u}` set expires after 300s.
+   */
+  private startPeerPresencePolling(peerId: string): void {
+    this.clearPeerPresenceTimer();
+    const me = getAccountId();
+    if (!me) return;
+    this.peerPresenceTimer = setInterval(() => {
+      // Only while we're actually in the foreground with a link — polling a suspended app would
+      // be exactly the overnight battery drain §M13 exists to prevent.
+      if (this.stopped || this.suspended || !this.online) return;
+      if (!this.activePresencePeers.has(this.activeConversationId ?? ''))
+        return;
+      void subscribePresence(me, [peerId]).catch(() => undefined);
+      void this.refreshPeerPresence(peerId);
+    }, PEER_PRESENCE_POLL_MS);
+  }
+
+  /**
    * A chat became active → resolve its DM peer (members − me), subscribe to the peer's live presence
    * (fan-out targets subscribers only), and fetch the current snapshot into the store. Returns the
    * peerId, or `null` for a group / note-to-self (no single-peer presence line). Never blocks the UI:
@@ -991,7 +1349,7 @@ class SyncEngine {
       try {
         const members = await getConversationMembers(conversationId);
         const others = members.filter(m => m !== me);
-        peerId = others.length === 1 ? (others[0] ?? null) : null;
+        peerId = others.length === 1 ? others[0] ?? null : null;
       } catch (e) {
         log.warn('presence members resolve failed', { reason: String(e) });
         return null;
@@ -1003,21 +1361,18 @@ class SyncEngine {
     void subscribePresence(me, [peer]).catch((e: unknown) => {
       log.warn('presence subscribe failed', { reason: String(e) });
     });
-    try {
-      const p = await getPresence(peer, me);
-      useRealtimeStore.getState().setPresence(peer, {
-        status: normalizePresenceStatus(p.status),
-        lastSeen: p.lastSeen,
-      });
-    } catch (e) {
-      log.warn('presence fetch failed', { reason: String(e) });
-    }
+    await this.refreshPeerPresence(peer);
+    // The snapshot alone is a single point-in-time reading and there is no live presence frame
+    // to correct it, so keep re-reading it while this chat is on screen.
+    this.startPeerPresencePolling(peer);
     return peer;
   }
 
   /** A chat closed → stop tracking its peer (the last-known snapshot may stay in the store). */
   deactivatePresence(conversationId: string): void {
     this.activePresencePeers.delete(conversationId);
+    // §M7: the poll belongs to the open chat — it must not outlive it.
+    if (this.activePresencePeers.size === 0) this.clearPeerPresenceTimer();
   }
 
   /** Inbound live presence frame (`presence`/`presence.changed`) → the store. */

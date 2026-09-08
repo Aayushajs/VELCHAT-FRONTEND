@@ -13,8 +13,10 @@
 import {
   upsertConversation,
   peerIdentityAgeMs,
+  conversationIdsForPeer,
   type ConversationPatch,
 } from '../../../infra';
+import { subscribeProfileChanged } from '../../../core';
 import { getProfile, getMediaUrl } from '../../user';
 
 /**
@@ -58,3 +60,44 @@ export async function refreshPeerIdentity(
     await upsertConversation(conversationId, patch).catch(() => undefined);
   }
 }
+
+/**
+ * Resolve this account's current name/photo and write it into every conversation that shows it.
+ *
+ * The TTL above is the right policy for "a peer might have changed something" — it costs one
+ * request per opened chat. It is the WRONG policy for "we KNOW this account just changed": the
+ * user watches their new picture not appear in the chat list for up to an hour, or until the app
+ * is killed. So a change is pushed, and the TTL stays as the background safety net.
+ */
+async function refreshPeerIdentityFor(accountId: string): Promise<void> {
+  // Yield once so every SYNCHRONOUS listener on the profile bus has run — in particular the one
+  // that drops this account from the profile response cache. Fetching before that would re-read
+  // the very copy we are trying to replace, and the row would be rewritten with the old photo.
+  await Promise.resolve();
+
+  const ids = await conversationIdsForPeer(accountId).catch(() => []);
+  if (ids.length === 0) return;
+
+  const profile = await getProfile(accountId).catch(() => null);
+  if (!profile) return;
+  const patch: ConversationPatch = {};
+  const name = profile.displayName?.trim();
+  if (name) patch.name = name;
+  if (profile.avatarMediaId) {
+    const media = await getMediaUrl(profile.avatarMediaId).catch(() => null);
+    if (media?.url) patch.peerAvatarUrl = media.url;
+  }
+  if (Object.keys(patch).length === 0) return;
+
+  for (const id of ids) {
+    // Re-allow the TTL path too: this conversation has been refreshed, and a later genuine
+    // staleness check should not be blocked by the once-per-session guard.
+    attempted.delete(id);
+    await upsertConversation(id, patch).catch(() => undefined);
+  }
+}
+
+// A profile change — ours or a peer's — lands in the chat list without waiting out the TTL.
+subscribeProfileChanged(accountId => {
+  void refreshPeerIdentityFor(accountId);
+});

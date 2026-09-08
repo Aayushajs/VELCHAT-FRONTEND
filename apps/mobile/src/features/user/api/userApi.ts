@@ -4,6 +4,7 @@
  */
 import { api } from '../../../infra';
 import { normalizeProfile, type Profile } from './profileShape';
+import { subscribeProfileChanged } from '../../../core';
 
 export { normalizeProfile };
 export type { Profile };
@@ -14,6 +15,12 @@ export type { Profile };
 // BOUNDED (§M0 rule 7): a TTL alone never removes anything, so a long session browsing the
 // directory grew this map without limit. Profiles are also another account's data — logout
 // must call `clearProfileCache()`.
+// Whoever caches a profile must hear when it changes; otherwise a successful photo change keeps
+// serving the old one until this TTL happens to expire.
+subscribeProfileChanged(accountId => {
+  profileCache.delete(accountId);
+});
+
 const PROFILE_TTL_MS = 5 * 60_000;
 const PROFILE_CACHE_CAP = 200;
 const profileCache = new Map<string, { at: number; profile: Profile }>();

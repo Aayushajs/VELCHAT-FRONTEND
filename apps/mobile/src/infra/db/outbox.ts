@@ -27,6 +27,8 @@ export interface OutboxItem {
   clientMsgId: string;
   /** attempts BEFORE this send (0 on first try). */
   attempts: number;
+  /** When the user actually composed it — the only honest start point for send latency. */
+  createdAt: number;
   input: SendMessageInput;
 }
 
@@ -232,6 +234,7 @@ export function claimNextDue(now: number): Promise<OutboxItem | null> {
       conversationId: candidate.conversationId ?? input.conversationId,
       clientMsgId: input.clientMsgId,
       attempts: candidate.attempts,
+      createdAt: candidate.createdAt,
       input,
     };
   });

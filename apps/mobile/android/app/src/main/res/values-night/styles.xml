@@ -8,8 +8,8 @@
         <!-- System navigation bar = the app's bottom tab surface (dark). -->
         <item name="android:navigationBarColor">#1A1A1C</item>
         <item name="android:windowLightNavigationBar">false</item>
-        <!-- Dark splash to match app-open in dark mode (API 31+; ignored below). -->
-        <item name="android:windowSplashScreenBackground">#0A0A0B</item>
+        <!-- Same pure-black brand field as the supplied launcher mark. -->
+        <item name="android:windowSplashScreenBackground">#000000</item>
         <item name="android:windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_foreground</item>
     </style>
 

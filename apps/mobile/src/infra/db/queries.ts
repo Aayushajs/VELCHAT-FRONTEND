@@ -28,7 +28,8 @@ export async function purgeAllLocalChat(): Promise<void> {
  * `observeWithColumns` so IN-PLACE field changes (unread cleared, preview updated) also
  * re-render — a plain `.observe()` under a `sortBy` only re-emits on reorder/identity.
  */
-export function observeConversations() {
+export function observeConversations(limit?: number) {
+  const bounds = limit !== undefined && limit > 0 ? [Q.take(limit)] : [];
   return getDatabase()
     .get<Conversation>('conversations')
     .query(
@@ -40,6 +41,11 @@ export function observeConversations() {
       Q.where('last_message_at', Q.gt(0)),
       Q.sortBy('is_pinned', Q.desc),
       Q.sortBy('last_message_at', Q.desc),
+      // A caller that only needs the top few (search's "frequent" strip) must say so. This query
+      // re-runs on EVERY write to its table, so while the search screen is open, materialising
+      // every conversation just to slice five of them paid the full list cost a second time —
+      // on every inbound message, tick and receipt.
+      ...bounds,
     )
     .observeWithColumns([
       'is_pinned',
@@ -63,7 +69,14 @@ export function observeConversations() {
 export async function listConversationIds(): Promise<string[]> {
   const rows = await getDatabase()
     .get<Conversation>('conversations')
-    .query()
+    .query(
+      // Most recent first: reconnect catches up in this order, so the first conversations to
+      // become current are the ones the user is most likely to open. In storage order the first
+      // thing caught up is arbitrary, and the "Syncing your messages…" banner ends up describing
+      // work nobody is waiting on. Conversations with no activity sort last (0) but are still
+      // visited — a missed first message would be sitting in exactly one of those.
+      Q.sortBy('last_message_at', Q.desc),
+    )
     .fetch();
   return rows.map(c => c.id);
 }
@@ -126,6 +139,22 @@ export async function peerIdentityAgeMs(
     .catch(() => null);
   const at = row?.peerAvatarAt;
   return at === undefined || at === null ? null : Date.now() - at;
+}
+
+/**
+ * Conversations whose peer is this account — the rows whose cached name/photo a profile change
+ * makes stale. Used to push a change into the chat list immediately instead of waiting out the
+ * revalidation TTL.
+ */
+export async function conversationIdsForPeer(
+  accountId: string,
+): Promise<string[]> {
+  if (!accountId) return [];
+  const rows = await getDatabase()
+    .get<Conversation>('conversations')
+    .query(Q.where('peer_id', accountId))
+    .fetch();
+  return rows.map(r => r.id);
 }
 
 /**

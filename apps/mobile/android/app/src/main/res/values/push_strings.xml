@@ -1,0 +1,54 @@
+<!--
+  Notification strings + the accent colour, kept in their own file so the push layer does not
+  reach into `strings.xml`/`styles.xml` (which the RN template owns and regenerates).
+
+  `translatable="false"` is NOT set: these are the only user-visible strings the native side
+  produces, and they are the first thing a localisation pass would want.
+-->
+<resources>
+    <!-- Notification channels (user-visible in Android Settings → Notifications). -->
+    <string name="push_channel_messages_name">Messages</string>
+    <string name="push_channel_messages_desc">New messages in your chats</string>
+    <string name="push_channel_calls_name">Calls</string>
+    <string name="push_channel_calls_desc">Incoming voice and video calls</string>
+
+    <!-- Notification body. The push carries the message text only when the server holds readable
+         plaintext (see the backend's preview.ts); these are the fallbacks for everything else. -->
+    <string name="push_new_message">New message</string>
+    <plurals name="push_new_messages">
+        <item quantity="one">%d new message</item>
+        <item quantity="other">%d new messages</item>
+    </plurals>
+    <string name="push_incoming_call">Incoming call</string>
+
+    <!-- How the user is named in their own notification thread (NotificationCompat.MessagingStyle
+         requires a Person for the local user). -->
+    <string name="push_you">You</string>
+
+    <!-- Attachments have no text body. The push carries the TYPE so these labels can be in the
+         user's language rather than the server's. -->
+    <string name="push_kind_image">Photo</string>
+    <string name="push_kind_video">Video</string>
+    <string name="push_kind_audio">Voice message</string>
+    <string name="push_kind_file">Document</string>
+    <string name="push_kind_location">Location</string>
+    <string name="push_kind_contact">Contact</string>
+    <string name="push_kind_poll">Poll</string>
+
+    <!-- Actions. -->
+    <string name="push_action_reply">Reply</string>
+    <string name="push_action_reply_hint">Message</string>
+    <string name="push_action_mark_read">Mark as read</string>
+    <string name="push_action_mute">Mute</string>
+    <string name="push_reply_sending">Sending…</string>
+
+    <!-- Group summary. -->
+    <string name="push_summary_title">VelChat</string>
+    <plurals name="push_summary_text">
+        <item quantity="one">%d new message</item>
+        <item quantity="other">%d new messages</item>
+    </plurals>
+
+    <!-- Brand violet — the notification accent, matching the app's gradient start. -->
+    <color name="push_accent">#7C5CFF</color>
+</resources>

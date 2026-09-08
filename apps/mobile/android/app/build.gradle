@@ -3,6 +3,17 @@ apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
 
 // react-native-config: map each build variant to its .env.<flavor> file (§M4 env flavors).
+//
+// BUILD ONE FLAVOR PER GRADLE INVOCATION. `dotenv.gradle`'s `getCurrentFlavor()` scans
+// `gradle.startParameter.taskNames` and stops at the FIRST match, then applies that single env
+// file to `defaultConfig` — i.e. to EVERY variant in the build. So
+//     ./gradlew assembleDevRelease assembleProdRelease
+// bakes .env.dev into BOTH APKs (the prod APK then silently points at the dev backend).
+// Correct:
+//     ENVFILE=.env.dev  ./gradlew assembleDevRelease
+//     ENVFILE=.env.prod ./gradlew assembleProdRelease
+// The explicit ENVFILE takes priority over this map, so it is the safe way to be certain.
+// Verify after building:  grep API_BASE_URL app/build/generated/source/buildConfig/<flavor>/release/com/velchat/BuildConfig.java
 project.ext.envConfigFiles = [
     devdebug             : ".env.dev",
     devdebugoptimized    : ".env.dev",
@@ -15,6 +26,105 @@ project.ext.envConfigFiles = [
     prodrelease          : ".env.prod",
 ]
 apply from: project(':react-native-config').projectDir.getPath() + "/dotenv.gradle"
+
+// ── Firebase Cloud Messaging (ADR 0008) ──────────────────────────────────────
+//
+// The google-services plugin FAILS the build when the flavor being built has no
+// `google-services.json`. That is unacceptable here for two reasons: a fresh clone has no
+// Firebase project at all, and `dev`/`stage` use different application ids
+// (com.velchat.dev / com.velchat.stage) which need their OWN Firebase Android clients — until
+// someone adds them, those flavors must keep building.
+//
+// So the plugin is applied only when a config for THIS build actually resolves. When it does
+// not, `FirebaseApp.getApps()` is empty at runtime, `VelChatPushModule.isSupported()` returns
+// false, JS reports `unsupported`, and the SyncEngine keeps its background socket — the
+// pre-push behaviour, un-crashed. See `docs/push-setup.md`.
+//
+// One flavor per Gradle invocation, same as the ENVFILE rule documented above: the flavor is
+// read from the task names, so `assembleDevRelease assembleProdRelease` in one call would
+// resolve a single config for both. Build them separately.
+def velchatFlavorNames = ["stage", "prod", "dev"]
+
+/**
+ * Which flavor is this invocation building, and REFUSE to guess when the answer is ambiguous.
+ *
+ * The comment above has warned about this for months and it happened anyway: a single
+ * `assembleDevRelease assembleProdRelease` bakes ONE env file into BOTH APKs, so the artifact
+ * named `app-prod-release.apk` silently pointed at the Render dev backend. It installs, it
+ * launches, it logs in — and then messages do not send and no push arrives, because it is
+ * talking to a different (and much older) server than its name claims. Nothing in the build
+ * output says so; you have to unzip the APK to find out.
+ *
+ * A comment cannot prevent that. Failing the build can. `env`/`google-services.json` are chosen
+ * per INVOCATION by `dotenv.gradle`, so an invocation that would produce APKs for more than one
+ * flavor — or for all of them, via a flavor-less `assembleRelease` — cannot be served correctly
+ * and is rejected instead of quietly mislabelled.
+ *
+ * Only artifact-producing tasks are checked. `compileProdDebugKotlin`, `test`, `lint` and the
+ * like are unaffected.
+ */
+def velchatBuildFlavor = {
+    // Original casing is kept for the messages: Gradle task names are case-sensitive, so a
+    // lowercased "assembleprodrelease" in the suggested fix would not run.
+    def taskNames = (gradle.startParameter.taskNames ?: []) as List<String>
+
+    def flavorOf = { String task ->
+        def lower = task.toLowerCase()
+        // Longest first so "stage" is not shadowed by a substring match.
+        velchatFlavorNames.find { lower.contains(it) }
+    }
+
+    def artifactTasks = taskNames.findAll { it.toLowerCase() =~ /(assemble|bundle|install)/ }
+    if (!artifactTasks.isEmpty()) {
+        def unscoped = artifactTasks.findAll { flavorOf(it) == null }
+        if (unscoped) {
+            throw new GradleException("""
+VelChat: ${unscoped} would build EVERY flavor, and react-native-config applies only ONE
+.env per invocation - the other flavors would be baked with the wrong API_BASE_URL.
+Name the flavor instead, e.g.:
+    ENVFILE=.env.prod ./gradlew assembleProdRelease
+""")
+        }
+        def flavors = artifactTasks.collect { flavorOf(it) }.unique()
+        if (flavors.size() > 1) {
+            def lines = flavors.collect { f ->
+                "    ENVFILE=.env.${f} ./gradlew " + artifactTasks.find { t -> flavorOf(t) == f }
+            }
+            throw new GradleException("""
+VelChat: refusing to build ${flavors} in one invocation.
+react-native-config applies ONE .env to every variant per invocation, so the extra flavors
+would be baked with another flavor's API_BASE_URL - i.e. an APK named "prod" that quietly
+talks to the dev backend. Messages do not send, push never arrives, and nothing in the build
+output says why.
+Run them separately:
+${lines.join(System.lineSeparator())}
+""")
+        }
+    }
+
+    // No artifact task (or a single well-scoped one): best-effort detection is fine.
+    return taskNames.collect { flavorOf(it) }.find { it != null }
+}()
+
+def velchatFirebaseConfig = {
+    def candidates = []
+    if (velchatBuildFlavor != null) {
+        candidates << file("src/${velchatBuildFlavor}/google-services.json")
+    }
+    // The app-level file applies to every flavor, so it is the only safe fallback when no
+    // flavor could be determined (a bare `./gradlew build`, or an IDE sync).
+    candidates << file("google-services.json")
+    return candidates.find { it.exists() }
+}()
+
+if (velchatFirebaseConfig != null) {
+    logger.lifecycle("VelChat push: using ${velchatFirebaseConfig}")
+} else {
+    // ASCII only: the Windows console this is usually read on renders a non-ASCII dash as mojibake.
+    logger.lifecycle(
+        "VelChat push: no google-services.json for flavor '${velchatBuildFlavor ?: "(none)"}' - " +
+        "building without FCM; push will report unsupported at runtime.")
+}
 
 /**
  * This is the configuration block to customize your React Native Android app.
@@ -104,6 +214,17 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        // react-native-config resolves BuildConfig by REFLECTION, and it looks the class up under
+        // the runtime APPLICATION ID:
+        //     Class.forName(context.getPackageName() + ".BuildConfig")
+        // The dev/stage flavors add an applicationIdSuffix, so their application ids are
+        // `com.velchat.dev` / `com.velchat.stage` while BuildConfig is always generated in the
+        // NAMESPACE, `com.velchat`. The lookup therefore threw ClassNotFoundException, the module
+        // returned an EMPTY config, and `core/config/env.ts` silently fell back to its production
+        // URLs — so every dev/stage build talked to the prod host (and prod only ever "worked"
+        // because its application id happens to equal the namespace).
+        // This resource is the hook the library checks first; point it at the real namespace.
+        resValue "string", "build_config_package", "com.velchat"
     }
     // §M1/§F1: distinct bundle IDs per env so all three install side by side.
     // dev -> com.velchat.dev, stage -> com.velchat.stage, prod -> com.velchat
@@ -149,9 +270,20 @@ dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
 
+    // The ONE dependency ADR 0008 accepts: FCM itself. Unconditional, so the push module always
+    // COMPILES; whether it can do anything is decided at runtime by the presence of a Firebase
+    // config (see `velchatFirebaseConfig` above). Notification building uses `androidx.core`,
+    // which arrives transitively as an `api` dependency of react-android's appcompat.
+    implementation("com.google.firebase:firebase-messaging:24.1.0")
+
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")
     } else {
         implementation jscFlavor
     }
+}
+
+// Applied LAST, and only when a config resolved — see the block near the top of this file.
+if (velchatFirebaseConfig != null) {
+    apply plugin: "com.google.gms.google-services"
 }

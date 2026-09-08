@@ -42,5 +42,48 @@
             <data android:scheme="velchat" />
         </intent-filter>
       </activity>
+
+      <!-- ── Push (ADR 0008) ────────────────────────────────────────────────
+           All three components are exported="false": nothing outside the app has
+           any business starting them. The FCM service is the exception the system
+           itself binds to, which it is allowed to do via its signature-checked
+           MESSAGING_EVENT action without the component being exported. -->
+
+      <!-- Receives data-only pushes. Runs with NO React context when the app is
+           killed — which is the entire point: it posts the notification AND sends
+           the delivery receipt from Kotlin. -->
+      <service
+        android:name=".push.VelChatMessagingService"
+        android:exported="false"
+        android:directBootAware="false">
+        <intent-filter>
+            <action android:name="com.google.firebase.MESSAGING_EVENT" />
+        </intent-filter>
+      </service>
+
+      <!-- Reply / Mark as read / Mute, handled without opening the app. -->
+      <receiver
+        android:name=".push.PushActionReceiver"
+        android:exported="false" />
+
+      <!-- Boots JS only for an action the user deliberately took (a reply needs the
+           real session; an incoming push does not). Bounded to 30 s. -->
+      <service
+        android:name=".push.PushHeadlessService"
+        android:exported="false" />
+
+      <!-- Applied by FCM when a notification-type push arrives with no handler. The
+           backend sends data-only messages so these should never be used, but a
+           missing icon here renders as a blank square rather than an error, and that
+           is not a failure mode worth leaving open. -->
+      <meta-data
+        android:name="com.google.firebase.messaging.default_notification_icon"
+        android:resource="@drawable/ic_notification" />
+      <meta-data
+        android:name="com.google.firebase.messaging.default_notification_color"
+        android:resource="@color/push_accent" />
+      <meta-data
+        android:name="com.google.firebase.messaging.default_notification_channel_id"
+        android:value="velchat.messages.v1" />
     </application>
 </manifest>

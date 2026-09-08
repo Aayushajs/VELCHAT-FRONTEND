@@ -12,3 +12,4 @@ export type { ConversationRowVM } from './hooks/useConversations';
 export { clearConversationPeerCache } from './hooks/useConversationPeer';
 export { useStartDm } from './hooks/useStartDm';
 export { backfillInbox } from './api/backfillInbox';
+export { clearStartDmCache } from './api/startDm';

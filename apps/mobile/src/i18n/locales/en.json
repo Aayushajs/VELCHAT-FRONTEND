@@ -218,7 +218,9 @@
     "remove": "Remove",
     "theme": "Theme: {{mode}} · tap to toggle",
     "offline": "You're offline — waiting for network",
-    "flightMode": "Flight mode on — you're offline"
+    "flightMode": "Flight mode on — you're offline",
+    "connecting": "Connecting…",
+    "syncing": "Syncing your messages…"
   },
   "status": {
     "title": "Status",

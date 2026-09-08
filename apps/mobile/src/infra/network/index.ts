@@ -23,6 +23,10 @@ export type { InboxConversation } from './conversations';
 export {
   getPresence,
   subscribePresence,
+  presenceOnline,
+  presenceOffline,
+  presenceHeartbeat,
+  PRESENCE_ONLINE_TTL_MS,
   normalizePresenceEvent,
 } from './presence';
 export type { PresenceResult, PresenceEvent } from './presence';
@@ -52,5 +56,6 @@ export {
   hasSession,
   setTokens,
   clearSession,
+  subscribeSession,
 } from './tokens';
 export type { SessionTokens } from './tokens';

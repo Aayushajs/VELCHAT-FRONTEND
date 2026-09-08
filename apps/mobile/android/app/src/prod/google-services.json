@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "627096855917",
+    "project_id": "velchat-66ac4",
+    "storage_bucket": "velchat-66ac4.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:627096855917:android:46e066712bfa86f120e664",
+        "android_client_info": {
+          "package_name": "com.velchat"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBumNF28cb0F2RjphKmH-95OViPlK-dIvc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

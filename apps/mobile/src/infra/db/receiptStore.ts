@@ -125,6 +125,33 @@ export function hasDirty(): boolean {
   return dirty.size > 0;
 }
 
+/**
+ * Forget what we believe the peer received, and report every conversation that still owes them
+ * something — so the current state is announced again.
+ *
+ * `socket.send()` returning true means the transport accepted the frame, not that the peer ever
+ * saw it. When the server accepted receipts and fanned out nothing, every client recorded them as
+ * sent and then never sent them again — leaving those messages on one tick permanently, because
+ * the only client that could correct them had decided the work was done.
+ *
+ * A reconnect is precisely when that belief is worthless. `desired` — what we want the peer to
+ * know — is untouched; only our assumption about them is dropped. One extra frame per conversation
+ * per reconnect buys a tick that can always heal.
+ */
+export function reassertReceipts(): string[] {
+  const owed: string[] = [];
+  for (const key of kv.getAllKeys()) {
+    if (key.startsWith(SENT_PREFIX)) kv.delete(key);
+    else if (key.startsWith(DESIRED_PREFIX)) {
+      const id = key.slice(DESIRED_PREFIX.length);
+      const want = getDesired(id);
+      if (want.delivered > 0 || want.read > 0) owed.push(id);
+    }
+  }
+  for (const id of owed) dirty.add(id);
+  return owed;
+}
+
 /** Logout: the next account must not inherit this one's receipt state. */
 export function clearAllReceipts(): void {
   dirty.clear();

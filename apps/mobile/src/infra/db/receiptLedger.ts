@@ -85,3 +85,78 @@ export function pendingReceiptFrames(
   }
   return frames;
 }
+
+/** A parsed inbound receipt: what the PEER has acknowledged, for this conversation. */
+export interface InboundReceipt {
+  conversationId: string;
+  upToSeq: number;
+  state: ReceiptState;
+}
+
+/** Read a string field under either casing. */
+function frameString(
+  d: Record<string, unknown>,
+  snake: string,
+  camel: string,
+): string | undefined {
+  const v = d[snake] ?? d[camel];
+  return typeof v === 'string' && v !== '' ? v : undefined;
+}
+
+/**
+ * Parse an inbound `receipt` frame, returning `null` for anything that must not be applied.
+ *
+ * The SELF-ECHO filter is the important part. The realtime-gateway's fan-out
+ * (`fanout-consumer.onReceipt`) routes a receipt to EVERY member of the conversation —
+ * including the member who just acknowledged — and `MessageReceiptPayload.user_id` is
+ * documented as "the recipient who acknowledged". Applying our own echo marks OUR OWN sent
+ * messages delivered/read the moment WE open the chat, so the ticks end up describing the
+ * reader's own behaviour instead of the peer's. `applyReceipt` filters on `sender_id = me`,
+ * which is exactly the set our own echo would (wrongly) lift.
+ *
+ * A frame with NO `user_id` is kept: older/pre-migration gateways omitted it, and dropping those
+ * would trade a wrong tick for a permanently stuck one. Likewise when our own id is unknown —
+ * we cannot prove a self-echo, and a real receipt must not be discarded on a guess.
+ */
+export function parseReceiptFrame(
+  data: unknown,
+  meId: string | undefined,
+  opts: { selfChat?: boolean } = {},
+): InboundReceipt | null {
+  if (!data || typeof data !== 'object') return null;
+  const d = data as Record<string, unknown>;
+
+  const conversationId = frameString(d, 'conversation_id', 'conversationId');
+  if (conversationId === undefined) return null;
+
+  const state =
+    d.state === 'read' ? 'read' : d.state === 'delivered' ? 'delivered' : null;
+  if (state === null) return null;
+
+  const seqRaw = d.up_to_seq ?? d.upToSeq ?? d.seq;
+  const upToSeq =
+    typeof seqRaw === 'number'
+      ? seqRaw
+      : typeof seqRaw === 'string' && seqRaw.trim() !== ''
+        ? Number(seqRaw)
+        : NaN;
+  if (!Number.isFinite(upToSeq) || upToSeq <= 0) return null;
+
+  // Our own acknowledgement, fanned back to us — never apply it to our own bubbles.
+  //
+  // Except in a conversation whose only member IS us ("Message yourself"), where our own receipt
+  // is the only one that will ever arrive. Discarding it there leaves those ticks stuck on `sent`
+  // forever, however plainly the message was delivered and read.
+  const actor = frameString(d, 'user_id', 'userId') ?? d.account_id;
+  if (
+    !opts.selfChat &&
+    meId !== undefined &&
+    typeof actor === 'string' &&
+    actor !== '' &&
+    actor === meId
+  ) {
+    return null;
+  }
+
+  return { conversationId, upToSeq: Math.floor(upToSeq), state };
+}

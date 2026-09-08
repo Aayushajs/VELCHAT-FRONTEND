@@ -17,6 +17,7 @@ import {
   KVKeys,
   getNetworkStatus,
   subscribeNetwork,
+  subscribeSession,
   warmBackend,
   purgeAllLocalChat,
   getAccountId,
@@ -26,6 +27,7 @@ import { startSync, stopSync, syncEngine } from '../domain/sync';
 import { prewarmContacts } from '../features/contacts';
 import { backfillInbox } from '../features/chat';
 import { getProfile } from '../features/user';
+import { startPushRuntime, stopPushRuntime } from '../features/notifications';
 import { useAuthBootstrap } from '../features/auth';
 import { ErrorBoundary } from './ErrorBoundary';
 import { Splash } from './Splash';
@@ -58,29 +60,49 @@ export default function App(): React.JSX.Element {
     // Wake the (free-tier, hibernating) backend up front so the login path is warm by
     // the time the user reaches it — no 30-50s cold-start timeout on the first request.
     warmBackend();
-    // NOTE: this account's own discovery token is now registered SERVER-SIDE at login (auth
-    // verifyOtp → directToken), and again as a side-effect of `prewarmContacts` discovery — so
-    // we no longer spend a separate client OPRF `evaluate` here (that doubled the rate-limited
-    // calls per launch). Findability is covered without it.
-    const acc = getAccountId();
-    // Warm the New-Chat contacts cache in the background so the list is instant when opened —
-    // no per-launch wait (best-effort; no-op without permission or a fresh cache).
-    if (acc) void prewarmContacts();
-    // Restore the chat list from the server (re-login / reinstall / post-logout wipe) so the
-    // inbox isn't empty — re-discovers conversations + pulls their recent messages (best-effort).
     // Give the sync engine a way to name a DM that arrives from someone new (§M3: the domain
     // layer cannot reach into features, so the lookup is injected here).
     syncEngine.setDisplayNameResolver(
       async id => (await getProfile(id)).displayName,
     );
-    if (acc) void backfillInbox();
+
+    /**
+     * Everything that needs a SIGNED-IN account. This used to run only in this mount effect,
+     * reading `getAccountId()` once — so signing in while the app was already running left it
+     * un-run for the rest of the session: the chat list stayed empty and the contacts cache
+     * cold, and only a force-quit (where the session exists at mount) appeared to fix it.
+     * Now it runs at mount AND on every sign-in.
+     *
+     * NOTE: this account's own discovery token is registered SERVER-SIDE at login (auth
+     * verifyOtp → directToken), and again as a side-effect of `prewarmContacts` discovery — so
+     * we no longer spend a separate client OPRF `evaluate` here.
+     */
+    const restoreForAccount = (): void => {
+      if (!getAccountId()) return;
+      // Warm the New-Chat contacts cache in the background so the list is instant when opened —
+      // no per-launch wait (best-effort; no-op without permission or a fresh cache).
+      void prewarmContacts();
+      // Restore the chat list from the server (re-login / reinstall / post-logout wipe) so the
+      // inbox isn't empty — re-discovers conversations + pulls their recent messages.
+      void backfillInbox();
+    };
+    restoreForAccount();
+    // Fires only on a real sign-in/sign-out transition, never on a token refresh.
+    const sessionUnsub = subscribeSession(present => {
+      if (present) restoreForAccount();
+    });
+
     // Mirror real network reachability into the connectivity store (offline banner + gating).
     const applyOnline = (connected: boolean): void =>
       useConnectivity.getState().setOnline(connected);
     void getNetworkStatus()
       .then(s => applyOnline(s.connected))
       .catch(() => undefined);
-    return subscribeNetwork(s => applyOnline(s.connected));
+    const netUnsub = subscribeNetwork(s => applyOnline(s.connected));
+    return () => {
+      sessionUnsub();
+      netUnsub();
+    };
   }, []);
 
   // MP2 messaging runtime (§L6): the outbox-backed send/receive + reconnect engine. Owns
@@ -103,6 +125,14 @@ export default function App(): React.JSX.Element {
       disposed = true;
       stopSync();
     };
+  }, []);
+
+  // Push (§M14/§L12, ADR 0008). Separate from the sync effect on purpose: it is what tells the
+  // engine whether it may sleep, and it also drains any Reply / Mark-as-read / Mute the user
+  // pressed on a notification while the app was not running.
+  useEffect(() => {
+    startPushRuntime();
+    return () => stopPushRuntime();
   }, []);
 
   return (
