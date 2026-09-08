@@ -277,6 +277,25 @@ internal class PushStore(context: Context) {
     return next
   }
 
+  /**
+   * How many conversations currently have a notification of ours on screen.
+   *
+   * Derived from our OWN counters rather than `NotificationManagerCompat.activeNotifications`,
+   * because `notify()` is asynchronous: a read taken immediately after posting routinely does
+   * not include the notification just posted, so the group summary was computed from a value
+   * that was wrong most of the time — and a stale summary can be the only thing the user sees.
+   * These counters are written synchronously by `bumpCount`/`clearCount`, so they cannot race.
+   */
+  fun countedConversations(): Int {
+    val counts = readJson(KEY_COUNTS)
+    var n = 0
+    val keys = counts.keys()
+    while (keys.hasNext()) {
+      if (counts.optInt(keys.next(), 0) > 0) n++
+    }
+    return n
+  }
+
   fun clearCount(conversationId: String) {
     val counts = readJson(KEY_COUNTS)
     counts.remove(conversationId)

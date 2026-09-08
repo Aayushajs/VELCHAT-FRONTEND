@@ -134,7 +134,11 @@ internal object PushNotifications {
       val ch =
           NotificationManagerCompat.from(context).getNotificationChannel(CHANNEL_MESSAGES)
               ?: return false // cannot tell — do not accuse the user of a setting
-      ch.importance == NotificationManager.IMPORTANCE_NONE
+      // NONE shows nothing at all. MIN shows no status-bar icon and no sound, which is
+      // indistinguishable from "broken" to a user waiting for a message — so both count as
+      // blocked for the purpose of telling them something is wrong.
+      ch.importance == NotificationManager.IMPORTANCE_NONE ||
+          ch.importance == NotificationManager.IMPORTANCE_MIN
     } catch (_: Throwable) {
       false
     }
@@ -185,62 +189,71 @@ internal object PushNotifications {
         )
 
     val id = notificationId(conversationId)
-    val builder =
-        NotificationCompat.Builder(context, CHANNEL_MESSAGES)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setColor(context.getColor(R.color.push_accent))
-            .setStyle(messagingStyle(context, conversationName, isGroup, lines))
-            // Set as well as styled: the lock screen, Wear, and some launchers read these
-            // directly and show nothing at all if only the style is populated.
-            .setContentTitle(conversationName)
-            .setContentText(if (isGroup && lines.size == 1) "${senderName}: $body" else body)
-            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-            .setWhen(System.currentTimeMillis())
-            .setShowWhen(true)
-            .setNumber(count)
-            .setGroup(GROUP_MESSAGES)
-            .setContentIntent(openConversationIntent(context, conversationId, id))
-            .setDeleteIntent(dismissIntent(context, conversationId, id))
-            .addAction(replyAction(context, conversationId, seq, id))
-            .addAction(markReadAction(context, conversationId, seq, id))
-            .addAction(muteAction(context, conversationId, id))
 
-    // The rich build is where the risk is: MessagingStyle, Person, a colour resource, a plural,
-    // the group summary. Any of those throwing meant NO notification at all, and the throw was
-    // swallowed by the caller so nothing said why. A plain notification is worth far more than a
-    // pretty one that does not appear, so a failure here falls back rather than gives up.
+    // The ENTIRE rich build is inside the try, not just `build()`.
+    //
+    // It was not, and that made the fallback below dead code for exactly the failures its own
+    // comment named: `messagingStyle(...)`, `getColor(...)` and the four PendingIntents were all
+    // evaluated while assembling `builder`, BEFORE the try opened. A throw from any of them
+    // escaped to the caller's swallowing catch in VelChatMessagingService, so there was no
+    // notification, no fallback, and no explanation.
     val posted =
         try {
+          val builder =
+              NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+                  .setSmallIcon(R.drawable.ic_notification)
+                  .setColor(context.getColor(R.color.push_accent))
+                  .setStyle(messagingStyle(context, conversationName, isGroup, lines))
+                  // Set as well as styled: the lock screen, Wear, and some launchers read these
+                  // directly and show nothing at all if only the style is populated.
+                  .setContentTitle(conversationName)
+                  .setContentText(
+                      if (isGroup && lines.size == 1) "$senderName: $body" else body)
+                  .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                  .setPriority(NotificationCompat.PRIORITY_HIGH)
+                  .setAutoCancel(true)
+                  .setWhen(System.currentTimeMillis())
+                  .setShowWhen(true)
+                  .setNumber(count)
+                  .setGroup(GROUP_MESSAGES)
+                  .setContentIntent(openConversationIntent(context, conversationId, id))
+                  .setDeleteIntent(dismissIntent(context, conversationId, id))
+                  .addAction(replyAction(context, conversationId, seq, id))
+                  .addAction(markReadAction(context, conversationId, seq, id))
+                  .addAction(muteAction(context, conversationId, id))
           postSafely(context, id, builder.build())
-          true
         } catch (e: Throwable) {
           Log.w(TAG, "rich notification failed (${e.javaClass.simpleName}); posting plain")
           false
         }
+
+    // A plain notification that appears beats a styled one that does not. This runs when the
+    // rich build threw AND when `notify()` itself refused — `postSafely` now reports which,
+    // instead of returning Unit and letting the caller assume success.
     if (!posted) {
-      try {
-        postSafely(
-            context,
-            id,
-            NotificationCompat.Builder(context, CHANNEL_MESSAGES)
-                .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle(conversationName)
-                .setContentText(body)
-                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-                .setPriority(NotificationCompat.PRIORITY_HIGH)
-                .setAutoCancel(true)
-                .setContentIntent(openConversationIntent(context, conversationId, id))
-                .build(),
-        )
-      } catch (e: Throwable) {
-        Log.w(TAG, "plain notification failed too: ${e.javaClass.simpleName}")
-        return false
-      }
+      val plain =
+          try {
+            postSafely(
+                context,
+                id,
+                NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+                    .setSmallIcon(R.drawable.ic_notification)
+                    .setContentTitle(conversationName)
+                    .setContentText(body)
+                    .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setAutoCancel(true)
+                    .setContentIntent(openConversationIntent(context, conversationId, id))
+                    .build(),
+            )
+          } catch (e: Throwable) {
+            Log.w(TAG, "plain notification failed too: ${e.javaClass.simpleName}")
+            false
+          }
+      if (!plain) return false
     }
-    // Never let the summary take the message notification down with it — it is decoration, and
-    // it reads `activeNotifications`, which several OEM builds throw from.
+
+    // Never let the summary take the message notification down with it — it is decoration.
     try {
       postSummary(context, store)
     } catch (e: Throwable) {
@@ -365,7 +378,8 @@ internal object PushNotifications {
    */
   private fun postSummary(context: Context, store: PushStore) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return // pre-N has no bundling
-    val active = groupedCount(context) ?: return
+    // Our own counters — see `PushStore.countedConversations` for why not the system's.
+    val active = store.countedConversations()
     if (active <= 1) {
       // A single conversation reads better on its own than under a summary.
       NotificationManagerCompat.from(context).cancel(SUMMARY_ID)
@@ -399,27 +413,9 @@ internal object PushNotifications {
     nm.cancel(notificationId(conversationId))
     // The summary must go too once it is the last thing left, or it strands as an empty group.
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-      if (groupedCount(context) == 0) nm.cancel(SUMMARY_ID)
+      if (store.countedConversations() == 0) nm.cancel(SUMMARY_ID)
     }
   }
-
-  /**
-   * How many per-conversation notifications this app currently has posted in the message group,
-   * or null when the system will not say.
-   *
-   * `getActiveNotifications()` reaches into the NotificationManager service, and several OEM
-   * builds throw from it rather than returning empty. Both callers are on paths that must not
-   * fail — one runs before the delivery ack in a killed-app wake, the other from a notification
-   * action — so "cannot tell" is answered with null and the summary is simply left alone.
-   */
-  private fun groupedCount(context: Context): Int? =
-      try {
-        NotificationManagerCompat.from(context).activeNotifications.count {
-          it.id != SUMMARY_ID && it.notification.group == GROUP_MESSAGES
-        }
-      } catch (_: Throwable) {
-        null
-      }
 
   fun cancelAll(context: Context, store: PushStore) {
     store.clearAllCounts()
@@ -440,14 +436,23 @@ internal object PushNotifications {
     return if (positive <= SUMMARY_ID) positive + SUMMARY_ID + 1 else positive
   }
 
-  private fun postSafely(context: Context, id: Int, notification: Notification) {
-    try {
-      NotificationManagerCompat.from(context).notify(id, notification)
-    } catch (_: SecurityException) {
-      // POST_NOTIFICATIONS revoked between the check above and here. Nothing to do, and
-      // certainly nothing worth crashing a background wake over.
-    }
-  }
+  /**
+   * Post, and report whether it actually happened.
+   *
+   * This used to return Unit and swallow `SecurityException` in silence, which made the caller's
+   * `try { postSafely(...); true }` hard-code success: a `notify()` that did nothing reported
+   * that it had, so the plain fallback never ran and no log said why the notification was
+   * missing. A refusal now returns false and is logged.
+   */
+  private fun postSafely(context: Context, id: Int, notification: Notification): Boolean =
+      try {
+        NotificationManagerCompat.from(context).notify(id, notification)
+        true
+      } catch (e: SecurityException) {
+        // POST_NOTIFICATIONS revoked between the check above and here.
+        Log.w(TAG, "notify() refused: ${e.javaClass.simpleName}")
+        false
+      }
 
   // ── intents ────────────────────────────────────────────────────────────────
 
