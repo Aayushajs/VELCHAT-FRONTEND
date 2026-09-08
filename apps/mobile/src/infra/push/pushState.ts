@@ -33,8 +33,20 @@ export function registrationKey(
   accountId: string,
   deviceId: string,
   token: string,
+  /**
+   * The backend this registration was made against.
+   *
+   * Without it, a device that switches environments — a dev APK and a prod APK share one
+   * `applicationId` per flavor, and a flavor's base URL can change between builds — keeps a
+   * lease that says "already registered" and SKIPS telling the new backend anything. Push then
+   * looks configured and is simply dead, with no error anywhere. That is the same class of
+   * silent-mislabel failure that shipped an APK pointing at the wrong server.
+   */
+  baseUrl: string,
 ): string {
-  return [accountId, deviceId, token].map(encodeURIComponent).join('|');
+  return [accountId, deviceId, token, baseUrl]
+    .map(encodeURIComponent)
+    .join('|');
 }
 
 /** Fold one event into the status. Returns the SAME object when nothing changed. */

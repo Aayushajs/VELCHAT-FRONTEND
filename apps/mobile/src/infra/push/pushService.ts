@@ -341,7 +341,7 @@ async function syncRegistration(): Promise<void> {
     return;
   }
 
-  const key = registrationKey(accountId, deviceId, token);
+  const key = registrationKey(accountId, deviceId, token, appEnv.apiBaseUrl);
 
   // Unconditionally, before the lease check: a cold start that SKIPS the network call still has
   // to re-mirror these, because native storage can be cleared independently of ours (app data

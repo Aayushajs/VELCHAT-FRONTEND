@@ -18,29 +18,32 @@ function run(...events: PushEvent[]): PushStatus {
   return events.reduce(reducePush, INITIAL_PUSH_STATUS);
 }
 
-const KEY = registrationKey('acc-1', 'dev-1', 'tok-1');
+const BASE = 'https://api.example.test';
+const KEY = registrationKey('acc-1', 'dev-1', 'tok-1', BASE);
 
 describe('registrationKey', () => {
   it('distinguishes account, device and token', () => {
-    expect(registrationKey('a', 'd', 't')).not.toBe(
-      registrationKey('b', 'd', 't'),
+    expect(registrationKey('a', 'd', 't', BASE)).not.toBe(
+      registrationKey('b', 'd', 't', BASE),
     );
-    expect(registrationKey('a', 'd', 't')).not.toBe(
-      registrationKey('a', 'e', 't'),
+    expect(registrationKey('a', 'd', 't', BASE)).not.toBe(
+      registrationKey('a', 'e', 't', BASE),
     );
-    expect(registrationKey('a', 'd', 't')).not.toBe(
-      registrationKey('a', 'd', 'u'),
+    expect(registrationKey('a', 'd', 't', BASE)).not.toBe(
+      registrationKey('a', 'd', 'u', BASE),
     );
   });
 
   it('is stable for the same triple', () => {
-    expect(registrationKey('a', 'd', 't')).toBe(registrationKey('a', 'd', 't'));
+    expect(registrationKey('a', 'd', 't', BASE)).toBe(
+      registrationKey('a', 'd', 't', BASE),
+    );
   });
 
   it('cannot be collided by a value containing the separator', () => {
     // 'a|d' + 'x' must not collide with 'a' + 'd|x'.
-    expect(registrationKey('a|d', 'x', 't')).not.toBe(
-      registrationKey('a', 'd|x', 't'),
+    expect(registrationKey('a|d', 'x', 't', BASE)).not.toBe(
+      registrationKey('a', 'd|x', 't', BASE),
     );
   });
 });
@@ -188,7 +191,7 @@ describe('shouldRegister — the duplicate-registration guard', () => {
   });
 
   it('is true when the account changed under the same token (logout → new login)', () => {
-    const otherAccount = registrationKey('acc-2', 'dev-1', 'tok-1');
+    const otherAccount = registrationKey('acc-2', 'dev-1', 'tok-1', BASE);
     expect(shouldRegister(registered, otherAccount)).toBe(true);
   });
 
@@ -200,6 +203,20 @@ describe('shouldRegister — the duplicate-registration guard', () => {
       { type: 'token', token: 'tok-1' },
     );
     expect(shouldRegister(denied, KEY)).toBe(true);
+  });
+
+  it('treats a DIFFERENT BACKEND as a different registration', () => {
+    // A device that switches environments must re-register. Without the base URL in the key, the
+    // lease says "already registered", the POST is skipped, and push is dead with no error —
+    // the same silent-mislabel class of failure that shipped an APK pointing at the wrong server.
+    const other = registrationKey(
+      'acc-1',
+      'dev-1',
+      'tok-1',
+      'https://other.example.test',
+    );
+    expect(other).not.toBe(KEY);
+    expect(shouldRegister(registered, other)).toBe(true);
   });
 
   it('is false without a token', () => {
