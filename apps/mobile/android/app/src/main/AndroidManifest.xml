@@ -11,6 +11,14 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Contact discovery (find which contacts are on VelChat) — salted hashes only. -->
     <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <!-- Lets the app ASK to be exempt from battery optimisation (ADR 0008).
+         Load-bearing, not a nicety: with the app in Doze or under an OEM's aggressive power
+         manager, FCM reports a data message as delivered and the OS never starts our
+         FirebaseMessagingService. The result is no notification AND no delivery receipt — so the
+         sender is stuck on one tick for a message that genuinely reached the handset. This is the
+         same exemption WhatsApp requests, and it is the only part of that problem an app can fix
+         for itself; per-OEM "Autostart" still has to be granted by hand. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- Bluetooth audio routing during calls (Android 12+ runtime permission). -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 

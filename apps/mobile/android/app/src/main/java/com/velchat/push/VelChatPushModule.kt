@@ -1,5 +1,9 @@
 package com.velchat.push
 
+import android.content.Intent
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -161,6 +165,16 @@ class VelChatPushModule(private val reactContext: ReactApplicationContext) :
     return map
   }
 
+  /**
+   * Tell native which chat is on screen, so a push for THAT chat is the only one suppressed.
+   * Passing null (on leaving the chat) is what re-enables notifications for it.
+   */
+  @ReactMethod
+  fun setActiveConversation(conversationId: String?, promise: Promise) {
+    store.setActiveConversation(conversationId?.takeIf { it.isNotBlank() })
+    promise.resolve(null)
+  }
+
   /** Keep the native mute in step with the server-side pref the user set inside the app. */
   @ReactMethod
   fun setMuted(conversationId: String, untilMillis: Double, promise: Promise) {
@@ -202,6 +216,77 @@ class VelChatPushModule(private val reactContext: ReactApplicationContext) :
     }
     promise.resolve(out)
   }
+
+  /**
+   * Is this app exempt from battery optimisation?
+   *
+   * When it is not, Doze and the OEM power managers are free to withhold a high-priority data
+   * message: FCM reports it delivered, `VelChatMessagingService` never runs, and the user gets
+   * neither a notification nor a second tick on the sender's side. Since nothing in the app can
+   * observe that happening, the exemption state is the closest thing to an explanation available
+   * — so it is reported rather than guessed at.
+   */
+  @ReactMethod
+  fun isIgnoringBatteryOptimizations(promise: Promise) {
+    promise.resolve(
+        try {
+          val pm = reactContext.getSystemService(PowerManager::class.java)
+          pm?.isIgnoringBatteryOptimizations(reactContext.packageName) ?: false
+        } catch (_: Throwable) {
+          false
+        })
+  }
+
+  /**
+   * Open the system prompt asking for that exemption.
+   *
+   * `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` shows a dialog the user accepts once. It is
+   * NOT silent and must be triggered by a deliberate user action; Play forbids nagging. Resolves
+   * false when the intent cannot be shown (no activity, or an OEM that removed the screen).
+   */
+  @ReactMethod
+  fun requestIgnoreBatteryOptimizations(promise: Promise) {
+    try {
+      val pkg = reactContext.packageName
+      val pm = reactContext.getSystemService(PowerManager::class.java)
+      if (pm?.isIgnoringBatteryOptimizations(pkg) == true) {
+        promise.resolve(true)
+        return
+      }
+      val intent =
+          Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            data = Uri.parse("package:$pkg")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          }
+      val activity = reactContext.currentActivity
+      if (activity != null) activity.startActivity(intent) else reactContext.startActivity(intent)
+      promise.resolve(true)
+    } catch (_: Throwable) {
+      // Some OEM builds remove this screen entirely. Falling back to the app's own settings page
+      // is better than a dead button.
+      promise.resolve(openAppSettings())
+    }
+  }
+
+  /** The app's own system settings page — where notifications and battery both live. */
+  @ReactMethod
+  fun openAppNotificationSettings(promise: Promise) {
+    promise.resolve(openAppSettings())
+  }
+
+  private fun openAppSettings(): Boolean =
+      try {
+        val intent =
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+              data = Uri.parse("package:${reactContext.packageName}")
+              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        val activity = reactContext.currentActivity
+        if (activity != null) activity.startActivity(intent) else reactContext.startActivity(intent)
+        true
+      } catch (_: Throwable) {
+        false
+      }
 
   /** Required by `NativeEventEmitter`; the emitter is driven from {@link PushBridge}. */
   @ReactMethod fun addListener(@Suppress("UNUSED_PARAMETER") eventName: String) = Unit

@@ -153,6 +153,12 @@ export interface NativePushBinding {
    */
   setPersonNames(names: Readonly<Record<string, string>>): Promise<void>;
 
+  /**
+   * Tell native which chat is on screen, so a push for THAT chat is the only one suppressed.
+   * `null` on leaving the chat re-enables notifications for it.
+   */
+  setActiveConversation(conversationId: string | null): Promise<void>;
+
   /** Keep the native mute in step with a pref the user set inside the app. 0 clears it. */
   setMuted(conversationId: string, untilMillis: number): Promise<void>;
 
@@ -168,6 +174,23 @@ export interface NativePushBinding {
 
   /** Drain the queue. The ONLY thing that empties it — callers must handle what they take. */
   takePendingEvents(): Promise<PushPendingEvent[]>;
+
+  /**
+   * Is the app exempt from battery optimisation?
+   *
+   * When it is not, Doze and the OEM power managers may withhold a high-priority data message
+   * entirely: FCM reports it delivered, the messaging service never runs, and the user gets
+   * neither a notification nor a second tick on the sender's side. Nothing in the app can
+   * observe that happening — this is the closest thing to an explanation available, which is
+   * why it is surfaced rather than guessed at.
+   */
+  isIgnoringBatteryOptimizations(): Promise<boolean>;
+
+  /** Show the system prompt for that exemption. Resolves false if no screen could be opened. */
+  requestIgnoreBatteryOptimizations(): Promise<boolean>;
+
+  /** Open this app's own system settings page (where notifications and battery both live). */
+  openAppSettings(): Promise<boolean>;
 }
 
 /** The body `POST /notifications/endpoints` expects (backend `RegisterEndpointDto`). */

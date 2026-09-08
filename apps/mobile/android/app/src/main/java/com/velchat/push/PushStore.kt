@@ -91,6 +91,7 @@ internal class PushStore(context: Context) {
         .remove(KEY_MUTED)
         .remove(KEY_PENDING)
         .remove(KEY_COUNTS)
+        .remove(KEY_ACTIVE_CONVO)
         .commit()
   }
 
@@ -224,6 +225,26 @@ internal class PushStore(context: Context) {
     return out
   }
 
+  // ── what the user is looking at ────────────────────────────────────────────
+
+  /**
+   * The conversation currently open on screen, mirrored from JS, or null.
+   *
+   * This is what makes suppression correct. Suppressing on "the app is resumed" alone was wrong
+   * in two ways: a user reading chat A got no notification for a message in chat B, and a user
+   * whose socket had quietly died got neither the message nor a notification — the app looked
+   * simply broken. Suppress only for the chat they are actually reading.
+   */
+  fun activeConversationId(): String? =
+      prefs.getString(KEY_ACTIVE_CONVO, null)?.takeIf { it.isNotBlank() }
+
+  fun setActiveConversation(conversationId: String?) {
+    // `commit()`: a push can arrive in the same instant the user opens a chat, and reading a
+    // stale value here posts a notification for the conversation already on screen.
+    @Suppress("ApplySharedPref")
+    prefs.edit().putString(KEY_ACTIVE_CONVO, conversationId).commit()
+  }
+
   // ── mute ───────────────────────────────────────────────────────────────────
 
   /** `conversationId -> epoch millis until which it is muted`. `Long.MAX_VALUE` = forever. */
@@ -320,6 +341,7 @@ internal class PushStore(context: Context) {
     private const val KEY_MUTED = "muted"
     private const val KEY_COUNTS = "counts"
     private const val KEY_PENDING = "pending"
+    private const val KEY_ACTIVE_CONVO = "activeConvo"
 
     private const val MAX_NAMES = 300
     private const val MAX_PENDING = 64

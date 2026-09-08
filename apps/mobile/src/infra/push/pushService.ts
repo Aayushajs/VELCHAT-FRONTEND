@@ -239,6 +239,19 @@ export function setNativeMute(
   void nativePush.setMuted(conversationId, untilMillis);
 }
 
+/**
+ * Tell the push layer which chat is on screen.
+ *
+ * This is the ONLY thing that suppresses a notification locally, and it is deliberately narrow:
+ * a message for a different chat must still notify, and so must one that arrives while the
+ * socket is quietly down — otherwise the app shows neither the message nor a notification.
+ */
+export function setActiveConversationForPush(
+  conversationId: string | null,
+): void {
+  void nativePush.setActiveConversation(conversationId);
+}
+
 /** The user opened a chat — drop its notification rather than leave a stale one in the tray. */
 export function clearConversationNotification(conversationId: string): void {
   void nativePush.clearConversationNotification(conversationId);
@@ -475,6 +488,46 @@ export function disposePush(): void {
   messageListeners.clear();
   availabilityListeners.clear();
   eventListeners.clear();
+}
+
+/**
+ * Why push cannot reach the user right now, or null when nothing is wrong.
+ *
+ * Deliberately just three states, because there are only three things a user can DO:
+ *   'notifications-off'  the OS will not let us display anything
+ *   'battery-restricted' the OS may refuse to start us for a push at all
+ *   'unsupported'        no push transport in this build/device (nothing to do)
+ *
+ * The battery case is the one worth surfacing loudest: it produces no error anywhere, and it
+ * silently costs the SENDER their second tick as well, because a service that never runs cannot
+ * acknowledge delivery.
+ */
+export type PushBlocker =
+  | 'notifications-off'
+  | 'battery-restricted'
+  | 'unsupported';
+
+export async function getPushBlocker(): Promise<PushBlocker | null> {
+  if (status.phase === 'unsupported') return 'unsupported';
+  if (status.permission !== 'granted') return 'notifications-off';
+  return (await nativePush.isIgnoringBatteryOptimizations())
+    ? null
+    : 'battery-restricted';
+}
+
+/**
+ * Ask the OS to fix the blocker. MUST be called from a user action — the battery prompt is a
+ * system dialog and Play forbids showing it unprompted.
+ */
+export async function resolvePushBlocker(
+  blocker: PushBlocker,
+): Promise<boolean> {
+  if (blocker === 'battery-restricted') {
+    return nativePush.requestIgnoreBatteryOptimizations();
+  }
+  // Notifications and the per-OEM autostart toggle both live in the app's settings page; there
+  // is no reliable intent for autostart, so this is as close as an app can get.
+  return nativePush.openAppSettings();
 }
 
 /** Test-only: reset module state between cases. */

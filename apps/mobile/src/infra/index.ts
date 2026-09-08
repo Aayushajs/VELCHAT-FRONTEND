@@ -191,7 +191,11 @@ export {
   syncPersonNames,
   setNativeMute,
   clearConversationNotification,
+  setActiveConversationForPush,
+  getPushBlocker,
+  resolvePushBlocker,
 } from './push';
+export type { PushBlocker } from './push';
 export type {
   PushMessage,
   PushPendingEvent,

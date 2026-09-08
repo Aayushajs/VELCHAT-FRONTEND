@@ -22,6 +22,9 @@ export {
   syncPersonNames,
   setNativeMute,
   clearConversationNotification,
+  setActiveConversationForPush,
+  getPushBlocker,
+  resolvePushBlocker,
   __resetPushForTests,
 } from './pushService';
 export {
@@ -36,6 +39,7 @@ export {
   registrationKey,
   shouldRegister,
 } from './pushState';
+export type { PushBlocker } from './pushService';
 export type {
   PushEvent,
   PushMessage,

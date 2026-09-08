@@ -79,11 +79,16 @@ class VelChatMessagingService : FirebaseMessagingService() {
     // against a numeric watermark would never match — parse it once, here.
     val seq = data["seq"]?.toLongOrNull() ?: 0L
 
-    // The server suppresses pushes for a user it believes is online, but that belief can lag a
-    // socket. Posting a notification for the message the user is watching arrive is the most
-    // obviously-broken thing a chat app can do, so re-check locally.
-    val resumed = PushBridge.isAppResumed(this)
-    if (!resumed) {
+    // Suppress ONLY for the conversation the user is actually reading.
+    //
+    // "The app is resumed" was too broad, and wrong in two directions: someone reading chat A got
+    // nothing for a message in chat B, and someone whose socket had quietly died got neither the
+    // message nor a notification — which reads as the app being broken rather than offline. The
+    // server already skips pushes for a user it believes is online; this is the local, narrower
+    // check for the one case a notification would genuinely be noise.
+    val onScreen =
+        PushBridge.isAppResumed(this) && store.activeConversationId() == conversationId
+    if (!onScreen) {
       // Isolated on purpose. The ack below is the ONLY thing that can produce a second tick for
       // a closed app, and it runs after this — so anything that can throw while drawing a
       // notification (an OEM's NotificationManager refusing `activeNotifications`, a resource
