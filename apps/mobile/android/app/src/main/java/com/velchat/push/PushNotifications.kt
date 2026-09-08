@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
 import androidx.core.app.RemoteInput
+import android.util.Log
 import com.velchat.MainActivity
 import com.velchat.R
 
@@ -40,8 +41,22 @@ import com.velchat.R
  */
 internal object PushNotifications {
 
-  const val CHANNEL_MESSAGES = "velchat.messages.v1"
-  const val CHANNEL_CALLS = "velchat.calls.v1"
+  /**
+   * Channel ids carry a version, and bumping it is the ONLY way to change a channel.
+   *
+   * `createNotificationChannel` is create-or-ignore: once a channel exists, Android keeps the
+   * user's (or an OEM's) importance and blocked state forever and silently discards whatever the
+   * app passes on later calls. So a channel that was ever created blocked, or at low importance,
+   * stays that way — notifications post successfully and never appear, with no error anywhere.
+   *
+   * v2 because v1 was created by earlier builds of this app and cannot be trusted; `ensureChannels`
+   * deletes the old one so it does not linger in the user's settings as a dead entry.
+   */
+  const val CHANNEL_MESSAGES = "velchat.messages.v2"
+  const val CHANNEL_CALLS = "velchat.calls.v2"
+
+  /** Channels this app created in the past. Deleted on sight — see the note above. */
+  private val LEGACY_CHANNELS = listOf("velchat.messages.v1", "velchat.calls.v1")
 
   /** Bundling key. Android auto-bundles from 4 notifications; the explicit group + summary
    *  makes the collapsed state say "5 new messages" instead of listing five identical lines. */
@@ -89,8 +104,40 @@ internal object PushNotifications {
               setShowBadge(false)
             }
 
+    // Drop the previous generation first, so a v1 the user (or an OEM) had blocked does not sit
+    // in Settings alongside v2 looking like the live one.
+    for (legacy in LEGACY_CHANNELS) {
+      try {
+        manager.deleteNotificationChannel(legacy)
+      } catch (_: Throwable) {
+        // Nothing to do: a channel that cannot be deleted is one we no longer post to.
+      }
+    }
+
     manager.createNotificationChannel(messages)
     manager.createNotificationChannel(calls)
+  }
+
+  /**
+   * Will a message notification actually be shown?
+   *
+   * `areNotificationsEnabled()` is APP-level and answers true while the message CHANNEL is
+   * blocked — which posts successfully and displays nothing. Both have to be checked, and the
+   * channel one is the trap: it cannot be repaired by the app, only by the user or by moving to
+   * a new channel id.
+   */
+  fun messagesChannelBlocked(context: Context): Boolean {
+    if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return true
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
+    return try {
+      ensureChannels(context)
+      val ch =
+          NotificationManagerCompat.from(context).getNotificationChannel(CHANNEL_MESSAGES)
+              ?: return false // cannot tell — do not accuse the user of a setting
+      ch.importance == NotificationManager.IMPORTANCE_NONE
+    } catch (_: Throwable) {
+      false
+    }
   }
 
   // ── posting ────────────────────────────────────────────────────────────────
@@ -160,8 +207,45 @@ internal object PushNotifications {
             .addAction(markReadAction(context, conversationId, seq, id))
             .addAction(muteAction(context, conversationId, id))
 
-    postSafely(context, id, builder.build())
-    postSummary(context, store)
+    // The rich build is where the risk is: MessagingStyle, Person, a colour resource, a plural,
+    // the group summary. Any of those throwing meant NO notification at all, and the throw was
+    // swallowed by the caller so nothing said why. A plain notification is worth far more than a
+    // pretty one that does not appear, so a failure here falls back rather than gives up.
+    val posted =
+        try {
+          postSafely(context, id, builder.build())
+          true
+        } catch (e: Throwable) {
+          Log.w(TAG, "rich notification failed (${e.javaClass.simpleName}); posting plain")
+          false
+        }
+    if (!posted) {
+      try {
+        postSafely(
+            context,
+            id,
+            NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle(conversationName)
+                .setContentText(body)
+                .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .setContentIntent(openConversationIntent(context, conversationId, id))
+                .build(),
+        )
+      } catch (e: Throwable) {
+        Log.w(TAG, "plain notification failed too: ${e.javaClass.simpleName}")
+        return false
+      }
+    }
+    // Never let the summary take the message notification down with it — it is decoration, and
+    // it reads `activeNotifications`, which several OEM builds throw from.
+    try {
+      postSummary(context, store)
+    } catch (e: Throwable) {
+      Log.i(TAG, "group summary skipped: ${e.javaClass.simpleName}")
+    }
     return true
   }
 
@@ -487,6 +571,8 @@ internal object PushNotifications {
       } else {
         PendingIntent.FLAG_UPDATE_CURRENT
       }
+
+  private const val TAG = "VelChatPushNotify"
 
   private const val ACTION_OPEN = 0
   private const val ACTION_REPLY = 1

@@ -184,6 +184,16 @@ export interface NativePushBinding {
    * observe that happening — this is the closest thing to an explanation available, which is
    * why it is surfaced rather than guessed at.
    */
+  /**
+   * Can a message notification actually be DISPLAYED — app-level and channel-level?
+   *
+   * The channel half is the one that hides: Android keeps a channel's importance forever once it
+   * exists and silently ignores later changes, so a channel that was ever blocked stays blocked
+   * while `areNotificationsEnabled()` still answers true. The notification then posts
+   * successfully and never appears.
+   */
+  areMessageNotificationsBlocked(): Promise<boolean>;
+
   isIgnoringBatteryOptimizations(): Promise<boolean>;
 
   /** Show the system prompt for that exemption. Resolves false if no screen could be opened. */

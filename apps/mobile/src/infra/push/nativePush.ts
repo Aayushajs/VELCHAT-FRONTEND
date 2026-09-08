@@ -40,6 +40,7 @@ interface VelChatPushNativeModule {
   setActiveConversation(conversationId: string | null): Promise<void>;
   setMuted(conversationId: string, untilMillis: number): Promise<void>;
   takePendingEvents(): Promise<unknown>;
+  areMessageNotificationsBlocked(): Promise<boolean>;
   isIgnoringBatteryOptimizations(): Promise<boolean>;
   requestIgnoreBatteryOptimizations(): Promise<boolean>;
   openAppNotificationSettings(): Promise<boolean>;
@@ -124,6 +125,7 @@ const unsupportedBinding: NativePushBinding = {
   clearConversationNotification: () => Promise.resolve(),
   onPendingEvents: () => () => undefined,
   takePendingEvents: () => Promise.resolve([]),
+  areMessageNotificationsBlocked: () => Promise.resolve(false),
   // `true` so a platform without the concept never nags the user about it.
   isIgnoringBatteryOptimizations: () => Promise.resolve(true),
   requestIgnoreBatteryOptimizations: () => Promise.resolve(false),
@@ -256,6 +258,16 @@ const androidBinding = (mod: VelChatPushNativeModule): NativePushBinding => ({
     if (!em) return () => undefined;
     const sub = em.addListener(EVENT_PENDING, () => cb());
     return () => sub.remove();
+  },
+
+  async areMessageNotificationsBlocked() {
+    try {
+      return await mod.areMessageNotificationsBlocked();
+    } catch {
+      // Unknown is reported as NOT blocked: telling the user to change a setting that is already
+      // correct is worse than staying quiet.
+      return false;
+    }
   },
 
   async isIgnoringBatteryOptimizations() {

@@ -218,6 +218,22 @@ class VelChatPushModule(private val reactContext: ReactApplicationContext) :
   }
 
   /**
+   * Are message notifications actually displayable — app-level AND channel-level?
+   *
+   * The channel half is the one that hides: `areNotificationsEnabled()` answers true while the
+   * message channel is blocked, so the notification posts and nothing appears.
+   */
+  @ReactMethod
+  fun areMessageNotificationsBlocked(promise: Promise) {
+    promise.resolve(
+        try {
+          PushNotifications.messagesChannelBlocked(reactContext)
+        } catch (_: Throwable) {
+          false
+        })
+  }
+
+  /**
    * Is this app exempt from battery optimisation?
    *
    * When it is not, Doze and the OEM power managers are free to withhold a high-priority data

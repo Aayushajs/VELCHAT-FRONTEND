@@ -8,8 +8,13 @@
  * all land at once.
  *
  * What this module deliberately does NOT do:
- *  - It never REQUESTS notification permission. Prompts are contextual (§M23) and belong to the
- *    onboarding screen; this only observes the answer.
+ *  - It never re-prompts for notification permission. It asks at most ONCE per install, and only
+ *    when the answer is still unknown — because the onboarding screen only ever runs before a
+ *    session exists, so a user who upgraded into an install that already had one was never asked
+ *    at all. That produced the worst possible failure: push registered, the push arrived, the
+ *    device acknowledged delivery, and `notify()` threw a SecurityException the notification
+ *    layer swallows by design. Nothing reported it anywhere. After that single ask it only
+ *    observes, and `resolvePushBlocker` is the user-initiated route back.
  *  - It never calls into `domain/`. Availability is published through
  *    `subscribePushAvailability`, which `app/App.tsx` wires to `syncEngine.setPushAvailable`.
  *    A direct import would close an `infra → domain → infra` cycle through the barrels.
@@ -18,7 +23,11 @@ import { Platform } from 'react-native';
 import { appEnv, log } from '../../core';
 import { kv } from '../kv';
 import { getAccountId, getDeviceId } from '../network';
-import { hasNotificationPermission, subscribeAppState } from '../native';
+import {
+  hasNotificationPermission,
+  requestNotificationPermission,
+  subscribeAppState,
+} from '../native';
 import { clearPushEndpoint, registerPushEndpoint } from './api';
 import { collapsePendingEvents } from './pendingEvents';
 import { nativePush } from './nativePush';
@@ -312,6 +321,36 @@ function mirrorCredentials(): void {
   void nativePush.setCredentials(appEnv.apiBaseUrl, deviceId, accountId);
 }
 
+/**
+ * Whether this install has already shown the notification prompt.
+ *
+ * Not "whether it was granted" — that is the OS's answer and can change. This only stops the app
+ * from asking twice, so a decline becomes the banner rather than a second dialog.
+ */
+const KV_ASKED_NOTIFICATIONS = 'push.askedNotifications.v1';
+
+/**
+ * Ask for notification permission ONCE per install, if the answer is still unknown.
+ *
+ * The onboarding screen asks — but it only runs before a session exists. A user who upgraded
+ * into an install that already had a session therefore skipped it entirely and had no route to
+ * the prompt at all. One ask, recorded, is the whole fix; everything after it is the banner.
+ */
+async function askForNotificationsOnce(): Promise<void> {
+  if (kv.getBoolean(KV_ASKED_NOTIFICATIONS)) return;
+  kv.set(KV_ASKED_NOTIFICATIONS, true); // recorded FIRST: a crash mid-prompt must not re-ask
+  try {
+    const outcome = await requestNotificationPermission();
+    log.info('push: asked for notification permission', { outcome });
+    apply({
+      type: 'permission',
+      permission: outcome === 'granted' ? 'granted' : 'denied',
+    });
+  } catch (err) {
+    log.info('push: notification prompt failed', { reason: String(err) });
+  }
+}
+
 async function refreshPermission(): Promise<void> {
   if (status.phase === 'unsupported') return;
   const granted = await hasNotificationPermission();
@@ -413,6 +452,8 @@ export function initPush(): Promise<void> {
       // registration that cannot complete offline.
       await drainPendingEvents();
       await refreshPermission();
+      // Only when the OS says no AND we have never asked — see `askForNotificationsOnce`.
+      if (status.permission !== 'granted') await askForNotificationsOnce();
       if (status.permission !== 'granted') {
         // Register anyway — see `syncRegistration`. `pushAvailable` still stays false, so the
         // SyncEngine keeps its socket; what we gain is a device that can be woken and can
@@ -509,15 +550,30 @@ export type PushBlocker =
 
 export async function getPushBlocker(): Promise<PushBlocker | null> {
   if (status.phase === 'unsupported') return 'unsupported';
-  if (status.permission !== 'granted') return 'notifications-off';
+
+  // Ask the OS, NOT our cached `status.permission`.
+  //
+  // That cache is populated by `initPush()`, and the banner mounts with the chat list — before
+  // init has finished. Its initial value is 'unavailable', so on every fresh start the banner
+  // announced "notifications are off" to a user whose notifications were on, then corrected
+  // itself invisibly. A diagnostic that cries wolf on launch is worse than none: it trains the
+  // user to ignore the one message that will eventually be true.
+  if (!(await hasNotificationPermission())) return 'notifications-off';
+
+  // Checked SEPARATELY from the permission: a user can have granted notifications and still see
+  // nothing, because the message CHANNEL is blocked. Android keeps a channel's importance
+  // forever once created and ignores later changes, so that state is invisible to the app-level
+  // check — and it is the combination that looks like the app is simply broken.
+  if (await nativePush.areMessageNotificationsBlocked())
+    return 'notifications-off';
   return (await nativePush.isIgnoringBatteryOptimizations())
     ? null
     : 'battery-restricted';
 }
 
 /**
- * Ask the OS to fix the blocker. MUST be called from a user action — the battery prompt is a
- * system dialog and Play forbids showing it unprompted.
+ * Ask the OS to fix the blocker. MUST be called from a user action — both prompts are system
+ * dialogs and Play forbids showing them unprompted.
  */
 export async function resolvePushBlocker(
   blocker: PushBlocker,
@@ -525,8 +581,27 @@ export async function resolvePushBlocker(
   if (blocker === 'battery-restricted') {
     return nativePush.requestIgnoreBatteryOptimizations();
   }
-  // Notifications and the per-OEM autostart toggle both live in the app's settings page; there
-  // is no reliable intent for autostart, so this is as close as an app can get.
+
+  // Try the REAL permission dialog first.
+  //
+  // This is the gap that made notifications silently impossible: the app asks for
+  // POST_NOTIFICATIONS once, during onboarding, and never again. A user who declined then — or
+  // who was never asked because they upgraded into an install that already had a session — had
+  // no route back. Push registered, the push arrived, the device even acknowledged delivery, and
+  // `notify()` threw a SecurityException that the notification layer swallows by design. Nothing
+  // anywhere reported it.
+  //
+  // `PermissionsAndroid.request` re-shows the dialog whenever the OS still allows it, so the
+  // one-tap fix is a real fix rather than a trip to Settings.
+  const outcome = await requestNotificationPermission();
+  if (outcome === 'granted') {
+    await refreshPermission();
+    return true;
+  }
+
+  // Permanently denied ("don't ask again"), or a platform with no runtime prompt. The app's own
+  // settings page is where notifications AND the per-OEM autostart toggle live; there is no
+  // reliable intent for the latter, so this is as close as an app can get.
   return nativePush.openAppSettings();
 }
 
