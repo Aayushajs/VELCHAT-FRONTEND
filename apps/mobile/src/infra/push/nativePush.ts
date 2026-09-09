@@ -37,6 +37,11 @@ interface VelChatPushNativeModule {
   clearSession(): Promise<void>;
   setConversationNames(names: Record<string, string>): Promise<void>;
   setPersonNames(names: Record<string, string>): Promise<void>;
+  /**
+   * Mirror accountId -> photo URL. Native caches the picture to a file while the app is alive,
+   * so the push path only ever decodes a local file — it cannot fetch anything.
+   */
+  setPersonAvatars(avatars: Record<string, string>): Promise<void>;
   setActiveConversation(conversationId: string | null): Promise<void>;
   setMuted(conversationId: string, untilMillis: number): Promise<void>;
   takePendingEvents(): Promise<unknown>;
@@ -120,6 +125,7 @@ const unsupportedBinding: NativePushBinding = {
   clearSession: () => Promise.resolve(),
   setConversationNames: () => Promise.resolve(),
   setPersonNames: () => Promise.resolve(),
+  setPersonAvatars: () => Promise.resolve(),
   setActiveConversation: () => Promise.resolve(),
   setMuted: () => Promise.resolve(),
   clearConversationNotification: () => Promise.resolve(),
@@ -225,6 +231,15 @@ const androidBinding = (mod: VelChatPushNativeModule): NativePushBinding => ({
       await mod.setPersonNames({ ...names });
     } catch {
       // A group notification falls back to an unattributed line. Same reasoning.
+    }
+  },
+
+  async setPersonAvatars(avatars) {
+    try {
+      await mod.setPersonAvatars({ ...avatars });
+    } catch {
+      // The notification keeps its letter avatar. A picture is the last thing worth logging per
+      // chat-list change.
     }
   },
 

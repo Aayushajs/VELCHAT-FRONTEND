@@ -240,6 +240,22 @@ export function syncPersonNames(names: Readonly<Record<string, string>>): void {
   void nativePush.setPersonNames(names);
 }
 
+/**
+ * Mirror accountId -> photo URL so a notification can show the sender face-first, the way every
+ * other messenger does.
+ *
+ * Only the URL crosses the bridge. Native downloads and shrinks the picture WHILE THE APP IS
+ * ALIVE, because the process that draws a notification has no JS runtime and must not do network
+ * work — that is the same rule the delivery receipt now lives under, and a photo has far less
+ * claim on that time than a message does.
+ */
+export function syncPersonAvatars(
+  avatars: Readonly<Record<string, string>>,
+): void {
+  if (Object.keys(avatars).length === 0) return;
+  void nativePush.setPersonAvatars(avatars);
+}
+
 /** Keep the native mute in step with a pref set inside the app. `0` clears it. */
 export function setNativeMute(
   conversationId: string,

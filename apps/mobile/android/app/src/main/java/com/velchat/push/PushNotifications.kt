@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
 import androidx.core.app.RemoteInput
+import androidx.core.graphics.drawable.IconCompat
 import android.util.Log
 import com.velchat.MainActivity
 import com.velchat.R
@@ -185,8 +186,16 @@ internal object PushNotifications {
     val lines =
         store.appendLine(
             conversationId,
-            PushStore.Line(senderName ?: conversationName, body, System.currentTimeMillis()),
+            PushStore.Line(
+                senderName ?: conversationName,
+                body,
+                System.currentTimeMillis(),
+                senderId = senderId,
+            ),
         )
+    // Remembered so the notification can be REBUILT after an inline reply with actions that
+    // still acknowledge the right message — see `showOwnReply`.
+    store.setLastSeq(conversationId, seq)
 
     val id = notificationId(conversationId)
 
@@ -203,12 +212,19 @@ internal object PushNotifications {
               NotificationCompat.Builder(context, CHANNEL_MESSAGES)
                   .setSmallIcon(R.drawable.ic_notification)
                   .setColor(context.getColor(R.color.push_accent))
-                  .setStyle(messagingStyle(context, conversationName, isGroup, lines))
+                  .setStyle(messagingStyle(context, store, conversationName, isGroup, lines))
                   // Set as well as styled: the lock screen, Wear, and some launchers read these
                   // directly and show nothing at all if only the style is populated.
                   .setContentTitle(conversationName)
                   .setContentText(
                       if (isGroup && lines.size == 1) "$senderName: $body" else body)
+                  // The COLLAPSED row does not draw the style's per-message faces, so the photo
+                  // has to be set here as well or it appears only once the user expands — which
+                  // is exactly when they no longer need help recognising who wrote.
+                  .apply {
+                    senderId?.let { PushAvatars.bitmap(store.personAvatarFile(it)) }?.let(
+                        ::setLargeIcon)
+                  }
                   .setCategory(NotificationCompat.CATEGORY_MESSAGE)
                   .setPriority(NotificationCompat.PRIORITY_HIGH)
                   .setAutoCancel(true)
@@ -223,7 +239,13 @@ internal object PushNotifications {
                   .addAction(muteAction(context, conversationId, id))
           postSafely(context, id, builder.build())
         } catch (e: Throwable) {
-          Log.w(TAG, "rich notification failed (${e.javaClass.simpleName}); posting plain")
+          // The MESSAGE as well as the class. "NoClassDefFoundError" alone cost a build-and-test
+          // round trip to identify; the message names the class and answers it immediately. No
+          // content or ids can reach here — this is a builder failure, not a payload.
+          Log.w(
+              TAG,
+              "rich notification failed (${e.javaClass.simpleName}: ${e.message}); posting plain",
+          )
           false
         }
 
@@ -271,6 +293,7 @@ internal object PushNotifications {
    */
   private fun messagingStyle(
       context: Context,
+      store: PushStore,
       conversationName: String,
       isGroup: Boolean,
       lines: List<PushStore.Line>,
@@ -278,6 +301,9 @@ internal object PushNotifications {
     val me = Person.Builder().setName(context.getString(R.string.push_you)).setKey("me").build()
     val style = NotificationCompat.MessagingStyle(me).setGroupConversation(isGroup)
     if (isGroup) style.conversationTitle = conversationName
+    // Photos are decoded ONCE per person, not once per line: a thread of ten messages from the
+    // same sender would otherwise decode the same file ten times on the push path.
+    val faces = HashMap<String, IconCompat?>()
     for (line in lines) {
       // A reply the user sent from the notification is attributed to THEM, so the thread reads
       // as a conversation rather than as the peer quoting the user back at themselves.
@@ -285,11 +311,33 @@ internal object PushNotifications {
           if (line.mine) me
           else {
             val name = line.sender ?: conversationName
-            Person.Builder().setName(name).setKey(name).build()
+            val builder = Person.Builder().setName(name).setKey(line.senderId ?: name)
+            line.senderId?.let { id ->
+              faces.getOrPut(id) { avatarIcon(store.personAvatarFile(id)) }?.let(builder::setIcon)
+            }
+            builder.build()
           }
       style.addMessage(line.text, line.at, person)
     }
     return style
+  }
+
+  /**
+   * The sender's photo as a notification icon, or null.
+   *
+   * The cached file is ALREADY a circle — `PushAvatars.circleCrop` shapes it once, when it is
+   * downloaded. So this hands the bitmap over as it is: `createWithAdaptiveBitmap` would apply
+   * the adaptive-icon mask on top, which keeps only the middle ~66% and visibly cut the face out
+   * of a portrait photo.
+   */
+  private fun avatarIcon(path: String?): IconCompat? {
+    val bitmap = PushAvatars.bitmap(path) ?: return null
+    return try {
+      IconCompat.createWithBitmap(bitmap)
+    } catch (e: Throwable) {
+      Log.i(TAG, "avatar icon failed: " + e.javaClass.simpleName)
+      null
+    }
   }
 
   /**
@@ -334,6 +382,12 @@ internal object PushNotifications {
    *
    * The real confirmation is the message appearing in the chat; this only has to stop the
    * notification looking like the reply was swallowed while the send is still in flight.
+   *
+   * It rebuilds the notification, so it must rebuild ALL of it. It did not: the actions were left
+   * off, and one reply therefore stripped Reply, Mark as read and Mute from the thread — the user
+   * answered once and then had to open the app to answer again, which is the entire thing these
+   * buttons exist to avoid. The seq the rebuilt actions carry comes from `PushStore.lastSeq`,
+   * because the reply itself does not know which message it is answering.
    */
   fun showOwnReply(context: Context, store: PushStore, conversationId: String, text: String) {
     if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return
@@ -348,13 +402,17 @@ internal object PushNotifications {
             PushStore.Line(null, text, System.currentTimeMillis(), mine = true),
         )
     val isGroup = lines.any { !it.mine && it.sender != null && it.sender != conversationName }
+    // What the actions will acknowledge. Zero is fine: `replyAction` still works (the reply
+    // carries its own text), and the receipt paths already refuse a non-positive seq rather than
+    // acknowledging something that does not exist.
+    val seq = store.lastSeq(conversationId)
 
     val id = notificationId(conversationId)
     val notification =
         NotificationCompat.Builder(context, CHANNEL_MESSAGES)
             .setSmallIcon(R.drawable.ic_notification)
             .setColor(context.getColor(R.color.push_accent))
-            .setStyle(messagingStyle(context, conversationName, isGroup, lines))
+            .setStyle(messagingStyle(context, store, conversationName, isGroup, lines))
             .setContentTitle(conversationName)
             .setContentText(text)
             .setSubText(context.getString(R.string.push_reply_sending))
@@ -367,6 +425,9 @@ internal object PushNotifications {
             .setGroup(GROUP_MESSAGES)
             .setContentIntent(openConversationIntent(context, conversationId, id))
             .setDeleteIntent(dismissIntent(context, conversationId, id))
+            .addAction(replyAction(context, conversationId, seq, id))
+            .addAction(markReadAction(context, conversationId, seq, id))
+            .addAction(muteAction(context, conversationId, id))
             .build()
     postSafely(context, id, notification)
   }

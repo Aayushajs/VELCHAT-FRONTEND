@@ -33,6 +33,7 @@ import {
   unregisterPush,
   syncConversationNames,
   syncPersonNames,
+  syncPersonAvatars,
   observeConversations,
   subscribeSession,
   type PushPendingEvent,
@@ -160,6 +161,7 @@ function startNameMirror(): void {
     namesSub = observeConversations(NAME_MIRROR_LIMIT).subscribe(rows => {
       const names: Record<string, string> = {};
       const people: Record<string, string> = {};
+      const faces: Record<string, string> = {};
       for (const row of rows) {
         const name = row.name?.trim();
         if (!name) continue;
@@ -168,9 +170,14 @@ function startNameMirror(): void {
         // what lets a notification attribute the message to a sender rather than to nobody.
         // Group members are not covered here and fall back to the conversation's own name.
         if (row.peerId) people[row.peerId] = name;
+        // The same row already carries the peer photo the chat list draws, so mirroring it costs
+        // one more map and no extra query. Native caches it to a file from here — the push path
+        // cannot fetch anything.
+        if (row.peerId && row.peerAvatarUrl) faces[row.peerId] = row.peerAvatarUrl;
       }
       syncConversationNames(names);
       syncPersonNames(people);
+      syncPersonAvatars(faces);
     });
   } catch {
     // No DB yet (first launch, before the adapter opens). Notifications fall back to a generic

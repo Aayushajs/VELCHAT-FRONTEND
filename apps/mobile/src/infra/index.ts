@@ -189,6 +189,7 @@ export {
   drainPendingEvents,
   syncConversationNames,
   syncPersonNames,
+  syncPersonAvatars,
   setNativeMute,
   clearConversationNotification,
   setActiveConversationForPush,

@@ -58,6 +58,8 @@ jest.mock('../../../infra', () => ({
   unregisterPush: async () => undefined,
   setNativeMute: (...a: unknown[]) => mockSetNativeMute(...a),
   syncConversationNames: () => undefined,
+  syncPersonNames: () => undefined,
+  syncPersonAvatars: () => undefined,
   observeConversations: () => ({ subscribe: () => ({ unsubscribe() {} }) }),
   getAccountId: () => mockState.accountId,
 }));

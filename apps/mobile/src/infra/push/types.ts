@@ -154,6 +154,15 @@ export interface NativePushBinding {
   setPersonNames(names: Readonly<Record<string, string>>): Promise<void>;
 
   /**
+   * Mirror accountId -> photo URL, so a notification can show the sender face-first.
+   *
+   * Only the URL crosses: native downloads and shrinks the picture while the app is alive and
+   * caches it as a file. The process that draws a notification has no JS runtime and must do no
+   * network work — a photo cannot be allowed to delay the message behind it.
+   */
+  setPersonAvatars(avatars: Readonly<Record<string, string>>): Promise<void>;
+
+  /**
    * Tell native which chat is on screen, so a push for THAT chat is the only one suppressed.
    * `null` on leaving the chat re-enables notifications for it.
    */

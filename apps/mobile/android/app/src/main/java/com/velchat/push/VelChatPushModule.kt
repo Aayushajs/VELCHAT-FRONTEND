@@ -162,6 +162,21 @@ class VelChatPushModule(private val reactContext: ReactApplicationContext) :
     promise.resolve(null)
   }
 
+  /**
+   * Mirror `accountId -> photo URL` so a notification can show the sender's face.
+   *
+   * Resolves immediately: the download it starts is deliberately not awaited. JS calls this from
+   * the chat-list observer, and a photo is worth nothing to a caller that is only passing through
+   * — while a promise that waited on the network would make every chat-list change hold a bridge
+   * call open. The photo appears on the next notification instead, which is soon enough for
+   * something the user has not asked for yet.
+   */
+  @ReactMethod
+  fun setPersonAvatars(avatars: ReadableMap, promise: Promise) {
+    PushAvatars.mirror(reactApplicationContext, store, toStringMap(avatars))
+    promise.resolve(null)
+  }
+
   private fun toStringMap(names: ReadableMap): Map<String, String> {
     val map = HashMap<String, String>()
     val it = names.keySetIterator()
