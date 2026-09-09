@@ -99,8 +99,19 @@ jest.mock('../../../infra/network/chat', () => {
       >,
     sendChatMessage: (input: SendMessageInput): Promise<SendAck> =>
       mockSendChat(input) as Promise<SendAck>,
+    fetchPeerReceipts: (conversationId: string): Promise<unknown[]> =>
+      Promise.resolve(mockServerReceipts.get(conversationId) ?? []),
   };
 });
+
+/**
+ * What the DURABLE receipt store holds, per conversation — the answer a client gets when it asks
+ * the server instead of waiting for a socket frame that may never come.
+ */
+const mockServerReceipts = new Map<
+  string,
+  { userId: string; state: 'delivered' | 'read'; upToSeq: number }[]
+>();
 
 interface NetSnapshot {
   isConnected: boolean;
@@ -911,6 +922,78 @@ describe('read receipts', () => {
     );
     const rows = await rowsBySeq(conv);
     expect(rows.map(r => r.state)).toEqual(['read', 'read', 'read', 'sent']);
+  });
+
+  it('repairs a tick from the durable store when the socket frame never arrived', async () => {
+    // The gap this closes. Receipts travel as live socket frames, and a frame missed is a frame
+    // lost: if the peer reads while this device is reconnecting, nothing ever re-derives it and
+    // the bubble keeps ONE tick however long ago it was really read. The server has held the
+    // answer all along (`receipts` in §B4.4) and nothing asked it.
+    serverHistory.set(
+      conv,
+      [1, 2, 3].map(seq => serverMsg(conv, seq, { senderId: ME })),
+    );
+    // No `onReceipt` is ever fired for this conversation — that is the point.
+    mockServerReceipts.set(conv, [
+      { userId: 'peer', state: 'read', upToSeq: 2 },
+    ]);
+
+    await bootConnected();
+
+    await until(
+      async () => (await rowsBySeq(conv))[1]?.state === 'read',
+      'the durable read watermark to repair the ticks',
+    );
+    const rows = await rowsBySeq(conv);
+    expect(rows.map(r => r.state)).toEqual(['read', 'read', 'sent']);
+  });
+
+  it('repairs a tick from the durable store when the socket frame never arrived', async () => {
+    // The gap this closes. Receipts travel as live socket frames, and a frame missed is a frame
+    // lost: if the peer reads while this device is reconnecting, nothing ever re-derives it and
+    // the bubble keeps ONE tick however long ago it was really read. The server has held the
+    // answer all along (receipts, §B4.4) and nothing asked it.
+    serverHistory.set(
+      conv,
+      [1, 2, 3].map(seq => serverMsg(conv, seq, { senderId: ME })),
+    );
+    // No onReceipt is ever fired for this conversation — that is the point.
+    mockServerReceipts.set(conv, [
+      { userId: 'peer', state: 'read', upToSeq: 2 },
+    ]);
+
+    await bootConnected();
+
+    await until(
+      async () => (await rowsBySeq(conv))[1]?.state === 'read',
+      'the durable read watermark to repair the ticks',
+    );
+    const rows = await rowsBySeq(conv);
+    expect(rows.map(r => r.state)).toEqual(['read', 'read', 'sent']);
+  });
+
+  it('repairs a tick from the durable store when the socket frame never arrived', async () => {
+    // The gap this closes. Receipts travel as live socket frames, and a frame missed is a frame
+    // lost: if the peer reads while this device is reconnecting, nothing ever re-derives it and
+    // the bubble keeps ONE tick however long ago it was really read. The server has held the
+    // answer all along (the receipts store, §B4.4) and nothing ever asked it.
+    serverHistory.set(
+      conv,
+      [1, 2, 3].map(seq => serverMsg(conv, seq, { senderId: ME })),
+    );
+    // No onReceipt is ever fired for this conversation — that is the point.
+    mockServerReceipts.set(conv, [
+      { userId: 'peer', state: 'read', upToSeq: 2 },
+    ]);
+
+    await bootConnected();
+
+    await until(
+      async () => (await rowsBySeq(conv))[1]?.state === 'read',
+      'the durable read watermark to repair the ticks',
+    );
+    const rows = await rowsBySeq(conv);
+    expect(rows.map(r => r.state)).toEqual(['read', 'read', 'sent']);
   });
 
   it('never regress when a stale watermark arrives after a newer one', async () => {

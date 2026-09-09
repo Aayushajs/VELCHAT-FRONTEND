@@ -43,6 +43,7 @@ import {
   isAppError,
   sendChatMessage,
   fetchMessagesAfter,
+  fetchPeerReceipts,
   normalizeServerMessage,
   applyServerMessage,
   applyServerMessages,
@@ -743,6 +744,22 @@ class SyncEngine {
    * newest hundreds invisible until several more reconnect cycles happened to fill them in.
    */
   private async backfillConversation(conversationId: string): Promise<void> {
+    try {
+      await this.pageBackfill(conversationId);
+    } finally {
+      // AFTER the messages, and on every exit path.
+      //
+      // Both halves matter. After, because a watermark applies to ROWS — reconciling first put it
+      // against messages this backfill had not created yet, and it silently did nothing. And on
+      // every path, because the case that needs repairing most is a reconnect with nothing new to
+      // fetch: the peer read while we were away, so there are no new messages and the ticks are
+      // still wrong.
+      await this.reconcilePeerReceipts(conversationId);
+    }
+  }
+
+  /** The paging half of {@link backfillConversation}. */
+  private async pageBackfill(conversationId: string): Promise<void> {
     let cursor = await maxSeqForConversation(conversationId);
     for (let page = 0; page < MAX_BACKFILL_PAGES; page++) {
       if (this.stopped) return;
@@ -780,6 +797,38 @@ class SyncEngine {
   }
 
   // ── receipts (§F2/§C5) ───────────────────────────────────────────────────
+  /**
+   * Read the peer's DURABLE watermark from the server and apply it.
+   *
+   * Receipts arrive as live socket frames, and a frame missed is a frame lost. If the peer read a
+   * message while this device happened to be reconnecting — a network flip, a process the OS just
+   * restarted, the seconds after a push woke us — that frame went nowhere, and nothing re-derived
+   * it: the bubble kept a single tick for the rest of its life however long ago it was read.
+   * `applyPeerWatermark` could not help, because it replays a LOCAL memory of frames that did
+   * arrive.
+   *
+   * Safe to call anywhere: `fetchPeerReceipts` answers with an empty list for any failure,
+   * including a 404 from a backend that predates the route, so a tick that cannot be repaired
+   * never costs the sync that carries the messages.
+   */
+  async reconcilePeerReceipts(conversationId: string): Promise<void> {
+    if (!hasSession()) return;
+    const me = getAccountId();
+    const rows = await fetchPeerReceipts(conversationId);
+    for (const r of rows) {
+      // Our own rows are dropped server-side; this is belt and braces for a proxy that is not.
+      if (me !== undefined && r.userId === me) continue;
+      try {
+        await applyReceipt(conversationId, r.upToSeq, r.state);
+      } catch (e) {
+        log.warn('apply durable receipt failed', {
+          conversationId,
+          reason: String(e),
+        });
+      }
+    }
+  }
+
   /** Re-apply what the peer already told us, for rows that only exist now. */
   private async applyPeerWatermark(conversationId: string): Promise<void> {
     const peer = getPeerWatermark(conversationId);

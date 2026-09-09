@@ -72,6 +72,11 @@ export function useMessages(conversationId: string): {
     // still there after a notification TAP, because tapping opens the app without clearing the
     // stacked "3 new messages" counter behind it.
     clearConversationNotification(conversationId);
+    // Repair ticks the socket could not deliver. A receipt published while this device was
+    // reconnecting is gone — nothing re-derives it — so a bubble can sit on one tick long after
+    // the peer read it. Opening the chat is exactly when that is visible, and the durable answer
+    // is one cheap read away. Never throws.
+    void syncEngine.reconcilePeerReceipts(conversationId);
     // Native suppresses a push only for the chat on screen, so it has to be told which
     // one that is — and told again (null) on leaving, or this chat stays silent.
     setActiveConversationForPush(conversationId);

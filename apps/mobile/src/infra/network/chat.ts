@@ -231,6 +231,48 @@ export async function sendChatMessage(
   return normalizeSendAck(res.data);
 }
 
+/** One member's durable watermark, as the receipts route returns it. */
+export interface PeerReceipt {
+  readonly userId: string;
+  readonly state: 'delivered' | 'read';
+  readonly upToSeq: number;
+}
+
+/**
+ * What the OTHER members of a conversation have delivered and read.
+ *
+ * Ticks arrive as live socket frames, and a frame missed is a frame lost: a receipt published
+ * while this device was reconnecting left that message on one tick for good, however long ago it
+ * was really read. This is the durable answer, read on reconnect to repair whatever was missed.
+ *
+ * Returns an empty list rather than throwing for ANY failure, including a 404 from a backend that
+ * predates the route. A tick that cannot be repaired must never break the sync that carries the
+ * messages themselves.
+ */
+export async function fetchPeerReceipts(
+  conversationId: string,
+): Promise<PeerReceipt[]> {
+  try {
+    const res = await api.get(
+      `/chat/conversations/${encodeURIComponent(conversationId)}/receipts`,
+    );
+    const rows: unknown[] = Array.isArray(res.data) ? res.data : [];
+    const out: PeerReceipt[] = [];
+    for (const row of rows) {
+      if (!row || typeof row !== 'object') continue;
+      const r = row as Record<string, unknown>;
+      const state = r.state === 'read' ? 'read' : r.state === 'delivered' ? 'delivered' : null;
+      const upToSeq = typeof r.upToSeq === 'number' ? r.upToSeq : Number(r.upToSeq);
+      const userId = typeof r.userId === 'string' ? r.userId : '';
+      if (!state || !userId || !Number.isFinite(upToSeq) || upToSeq <= 0) continue;
+      out.push({ userId, state, upToSeq: Math.floor(upToSeq) });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Backfill missed messages for one conversation after `afterSeq` (§L6 reconnect path).
  * THE no-loss backstop behind best-effort WS push. Rows are returned ordered by `seq`

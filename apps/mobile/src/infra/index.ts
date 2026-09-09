@@ -12,6 +12,7 @@ export {
   warmBackend,
   sendChatMessage,
   fetchMessagesAfter,
+  fetchPeerReceipts,
   normalizeSendAck,
   normalizeServerMessage,
   createDm,
