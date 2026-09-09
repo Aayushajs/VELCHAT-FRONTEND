@@ -39,6 +39,8 @@ import {
   refreshSession,
   getRefreshToken,
   accessTokenExpiresInMs,
+  kv,
+  KVKeys,
   subscribeSession,
   type PushPendingEvent,
 } from '../../../infra';
@@ -193,6 +195,14 @@ function startNameMirror(): void {
         // cannot fetch anything.
         if (row.peerId && row.peerAvatarUrl) faces[row.peerId] = row.peerAvatarUrl;
       }
+      // Our OWN photo, under our own account id.
+      //
+      // A notification thread shows both sides once the user replies inline, and without this
+      // their own line was the only one with no face on it. The native side looks it up by the
+      // account id it already stores for the ack credential, so this needs no new plumbing.
+      const me = getAccountId();
+      const mine = kv.getString(KVKeys.avatarUrl);
+      if (me && mine) faces[me] = mine;
       syncConversationNames(names);
       syncPersonNames(people);
       syncPersonAvatars(faces);

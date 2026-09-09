@@ -56,6 +56,12 @@ internal object PushNotifications {
   const val CHANNEL_MESSAGES = "velchat.messages.v2"
   const val CHANNEL_CALLS = "velchat.calls.v2"
 
+  /**
+   * The channel for the brief foreground service that finishes an inline reply. Separate from
+   * messages so the user can silence it without silencing the thing they actually want.
+   */
+  const val CHANNEL_WORKING = "velchat.working.v1"
+
   /** Channels this app created in the past. Deleted on sight — see the note above. */
   private val LEGACY_CHANNELS = listOf("velchat.messages.v1", "velchat.calls.v1")
 
@@ -115,8 +121,44 @@ internal object PushNotifications {
       }
     }
 
+    // The channel a brief foreground service posts on while it sends a reply the user typed into
+    // a notification. MIN importance: it exists because Android requires a foreground service to
+    // be visible, not because the user needs telling — they just pressed send.
+    val working =
+        NotificationChannel(
+                CHANNEL_WORKING,
+                context.getString(R.string.push_channel_working_name),
+                NotificationManager.IMPORTANCE_MIN,
+            )
+            .apply {
+              description = context.getString(R.string.push_channel_working_desc)
+              setShowBadge(false)
+              enableVibration(false)
+              setSound(null, null)
+            }
+
     manager.createNotificationChannel(messages)
     manager.createNotificationChannel(calls)
+    manager.createNotificationChannel(working)
+  }
+
+  /**
+   * The notification a foreground service must show while it finishes a reply.
+   *
+   * Deliberately the quietest thing the platform allows: MIN importance, no sound, no badge, and
+   * gone as soon as the send completes. The user pressed send — the confirmation they want is the
+   * message appearing in the chat, not a status bar entry about it.
+   */
+  fun workingNotification(context: Context): Notification {
+    ensureChannels(context)
+    return NotificationCompat.Builder(context, CHANNEL_WORKING)
+        .setSmallIcon(R.drawable.ic_notification)
+        .setContentTitle(context.getString(R.string.push_working_title))
+        .setPriority(NotificationCompat.PRIORITY_MIN)
+        .setOngoing(true)
+        .setSilent(true)
+        .setShowWhen(false)
+        .build()
   }
 
   /**
@@ -298,7 +340,17 @@ internal object PushNotifications {
       isGroup: Boolean,
       lines: List<PushStore.Line>,
   ): NotificationCompat.MessagingStyle {
-    val me = Person.Builder().setName(context.getString(R.string.push_you)).setKey("me").build()
+    // Our own photo too, looked up by the account id native already stores for the ack credential.
+    // Once the user replies inline the thread shows both sides, and their own line was the only
+    // one with no face on it.
+    val me =
+        Person.Builder()
+            .setName(context.getString(R.string.push_you))
+            .setKey("me")
+            .apply {
+              store.accountId()?.let { id -> avatarIcon(store.personAvatarFile(id))?.let(::setIcon) }
+            }
+            .build()
     val style = NotificationCompat.MessagingStyle(me).setGroupConversation(isGroup)
     if (isGroup) style.conversationTitle = conversationName
     // Photos are decoded ONCE per person, not once per line: a thread of ten messages from the

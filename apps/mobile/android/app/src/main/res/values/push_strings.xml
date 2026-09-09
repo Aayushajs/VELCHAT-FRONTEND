@@ -12,6 +12,13 @@
     <string name="push_channel_calls_name">Calls</string>
     <string name="push_channel_calls_desc">Incoming voice and video calls</string>
 
+    <!-- The brief foreground service that finishes a reply typed into a notification. Android
+         requires such a service to be visible; the channel is MIN importance because the user
+         just pressed send and does not need telling. -->
+    <string name="push_channel_working_name">Sending</string>
+    <string name="push_channel_working_desc">Shown briefly while a reply you sent from a notification finishes sending</string>
+    <string name="push_working_title">Sending your reply…</string>
+
     <!-- Notification body. The push carries the message text only when the server holds readable
          plaintext (see the backend's preview.ts); these are the fallbacks for everything else. -->
     <string name="push_new_message">New message</string>

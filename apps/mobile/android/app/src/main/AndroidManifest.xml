@@ -4,6 +4,8 @@
     <!-- Runtime notification permission (Android 13+ / API 33). Requested on the
          Notifications onboarding step via PermissionsAndroid. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- The reply-sending service above. Required since API 28 to call startForeground at all. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Light haptic feedback on step/tab transitions (Vibration API). -->
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Media capture + voice/video calls. -->
@@ -76,9 +78,15 @@
 
       <!-- Boots JS only for an action the user deliberately took (a reply needs the
            real session; an incoming push does not). Bounded to 30 s. -->
+      <!-- Promotes itself to the foreground the moment it starts. A notification action only
+           grants a few seconds of background-start allowlist, and a reply sent after that was
+           refused and left queued until the next app launch. 'shortService' is the platform type
+           for exactly this: brief work the user just asked for, and the only one that needs no
+           additional type permission. -->
       <service
         android:name=".push.PushHeadlessService"
-        android:exported="false" />
+        android:exported="false"
+        android:foregroundServiceType="shortService" />
 
       <!-- Applied by FCM when a notification-type push arrives with no handler. The
            backend sends data-only messages so these should never be used, but a

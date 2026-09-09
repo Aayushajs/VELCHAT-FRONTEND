@@ -17,15 +17,15 @@
                         <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
                         <subviews>
                             <imageView clipsSubviews="YES" userInteractionEnabled="NO" contentMode="scaleAspectFit" horizontalHuggingPriority="251" verticalHuggingPriority="251" image="SplashLogo" translatesAutoresizingMaskIntoConstraints="NO" id="owl-logo">
-                                <rect key="frame" x="107.5" y="259.5" width="160" height="160"/>
+                                <rect key="frame" x="117.5" y="269.5" width="140" height="140"/>
                             </imageView>
                         </subviews>
-                        <color key="backgroundColor" systemColor="systemBackgroundColor" cocoaTouchSystemColor="whiteColor"/>
+                        <color key="backgroundColor" red="0.0" green="0.0" blue="0.0" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
                         <constraints>
                             <constraint firstItem="owl-logo" firstAttribute="centerX" secondItem="Ze5-6b-2t3" secondAttribute="centerX" id="owl-center-x"/>
                             <constraint firstItem="owl-logo" firstAttribute="centerY" secondItem="Ze5-6b-2t3" secondAttribute="centerY" id="owl-center-y"/>
-                            <constraint firstItem="owl-logo" firstAttribute="width" constant="160" id="owl-width"/>
-                            <constraint firstItem="owl-logo" firstAttribute="height" constant="160" id="owl-height"/>
+                            <constraint firstItem="owl-logo" firstAttribute="width" constant="140" id="owl-width"/>
+                            <constraint firstItem="owl-logo" firstAttribute="height" constant="140" id="owl-height"/>
                         </constraints>
                         <viewLayoutGuide key="safeArea" id="Bcu-3y-fUS"/>
                     </view>
