@@ -170,6 +170,11 @@ class SyncEngine {
   private started = false;
   private stopped = true;
   private draining = false;
+  /**
+   * The walk currently in progress, so a caller who needs the queue actually EMPTY can wait for
+   * it instead of being told it is somebody else's problem. See `flushOutboxNow`.
+   */
+  private drainInFlight: Promise<void> | null = null;
   /** Set when the server rate-limits a send; no drain runs before it expires. */
   private outboxCooldownUntil = 0;
   /**
@@ -360,6 +365,7 @@ class SyncEngine {
     this.socket = null;
     s?.close();
     this.draining = false;
+    this.drainInFlight = null;
   }
 
   // ── connectivity ─────────────────────────────────────────────────────────
@@ -1055,14 +1061,41 @@ class SyncEngine {
    * live and already draining, the `draining` guard makes this a no-op.
    */
   async flushOutboxNow(): Promise<void> {
+    // Join a walk already in progress, then walk once more.
+    //
+    // The caller is a headless task, and Android kills it the INSTANT this resolves. `sendText`
+    // kicks a drain of its own and returns, so the old code found `draining` set and came back in
+    // milliseconds: the task completed, the foreground service stopped, and the HTTP send died in
+    // flight. The reply sat in the outbox until the app was next opened — from the user's side,
+    // indistinguishable from a reply that never sent. On a real device the service stopped 164 ms
+    // after JS began draining.
+    //
+    // The second walk is not belt-and-braces: a row written after the first walk claimed its last
+    // item would otherwise be left behind, and that row is the reply.
+    const running = this.drainInFlight;
+    if (running) await running.catch(() => undefined);
     await this.drainOutbox({ ignoreLifecycle: true });
   }
 
-  private async drainOutbox(
+  private drainOutbox(opts: { ignoreLifecycle?: boolean } = {}): Promise<void> {
+    // A walk already in progress is RETURNED, not swallowed.
+    //
+    // This used to be `if (this.draining) return`, which told the caller the queue was dealt with
+    // when in fact somebody else was halfway through it. Harmless for a fire-and-forget kick;
+    // fatal for `flushOutboxNow`, whose caller is killed the moment it resolves.
+    if (this.draining) return this.drainInFlight ?? Promise.resolve();
+    this.draining = true;
+    const run = this.walkOutbox(opts).finally(() => {
+      this.draining = false;
+      this.drainInFlight = null;
+    });
+    this.drainInFlight = run;
+    return run;
+  }
+
+  private async walkOutbox(
     opts: { ignoreLifecycle?: boolean } = {},
   ): Promise<void> {
-    if (this.draining) return;
-    this.draining = true;
     try {
       // Never claim before crash-recovery has un-stuck orphaned `sending` rows.
       if (this.recovery) await this.recovery;
@@ -1106,6 +1139,9 @@ class SyncEngine {
         }
       }
     } finally {
+      // Cleared HERE, before the next drain is scheduled, and again by `drainOutbox` when this
+      // promise settles. Both matter: `scheduleOutbox` reads the queue and arms the timer that
+      // continues a backlog, and it must not do that while the flag still says a walk is running.
       this.draining = false;
       void this.scheduleOutbox();
     }

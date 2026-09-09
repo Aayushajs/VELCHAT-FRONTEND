@@ -924,52 +924,42 @@ describe('read receipts', () => {
     expect(rows.map(r => r.state)).toEqual(['read', 'read', 'read', 'sent']);
   });
 
-  it('repairs a tick from the durable store when the socket frame never arrived', async () => {
-    // The gap this closes. Receipts travel as live socket frames, and a frame missed is a frame
-    // lost: if the peer reads while this device is reconnecting, nothing ever re-derives it and
-    // the bubble keeps ONE tick however long ago it was really read. The server has held the
-    // answer all along (`receipts` in §B4.4) and nothing asked it.
-    serverHistory.set(
-      conv,
-      [1, 2, 3].map(seq => serverMsg(conv, seq, { senderId: ME })),
+  it('flushOutboxNow waits for a send already in flight', async () => {
+    // The reply-from-a-notification bug, reduced to one assertion.
+    //
+    // A headless task is killed the INSTANT its promise resolves. `sendText` kicks a drain of its
+    // own and returns, so `flushOutboxNow` saw `draining` and returned immediately: the task
+    // completed, the foreground service stopped, and the HTTP send died in flight. The reply then
+    // sat in the outbox until the app was next opened — from the user's side, indistinguishable
+    // from a reply that never sent. Measured on a real device: the service stopped 164 ms after
+    // JS began draining.
+    let release: (() => void) | undefined;
+    mockSendChat.mockImplementationOnce(
+      (input: SendMessageInput) =>
+        new Promise(resolve => {
+          release = () =>
+            resolve({
+              messageId: 'srv_slow',
+              seq: 1,
+              clientMsgId: input.clientMsgId,
+            });
+        }),
     );
-    // No `onReceipt` is ever fired for this conversation — that is the point.
-    mockServerReceipts.set(conv, [
-      { userId: 'peer', state: 'read', upToSeq: 2 },
-    ]);
 
     await bootConnected();
+    // Starts the drain that used to make the flush a no-op.
+    await syncEngine.sendText(conv, ME, 'slow one');
 
-    await until(
-      async () => (await rowsBySeq(conv))[1]?.state === 'read',
-      'the durable read watermark to repair the ticks',
-    );
-    const rows = await rowsBySeq(conv);
-    expect(rows.map(r => r.state)).toEqual(['read', 'read', 'sent']);
-  });
+    let flushed = false;
+    const flush = syncEngine.flushOutboxNow().then(() => {
+      flushed = true;
+    });
+    await new Promise(r => setTimeout(r, 50));
+    expect(flushed).toBe(false); // the send is still in flight
 
-  it('repairs a tick from the durable store when the socket frame never arrived', async () => {
-    // The gap this closes. Receipts travel as live socket frames, and a frame missed is a frame
-    // lost: if the peer reads while this device is reconnecting, nothing ever re-derives it and
-    // the bubble keeps ONE tick however long ago it was really read. The server has held the
-    // answer all along (receipts, §B4.4) and nothing asked it.
-    serverHistory.set(
-      conv,
-      [1, 2, 3].map(seq => serverMsg(conv, seq, { senderId: ME })),
-    );
-    // No onReceipt is ever fired for this conversation — that is the point.
-    mockServerReceipts.set(conv, [
-      { userId: 'peer', state: 'read', upToSeq: 2 },
-    ]);
-
-    await bootConnected();
-
-    await until(
-      async () => (await rowsBySeq(conv))[1]?.state === 'read',
-      'the durable read watermark to repair the ticks',
-    );
-    const rows = await rowsBySeq(conv);
-    expect(rows.map(r => r.state)).toEqual(['read', 'read', 'sent']);
+    release?.();
+    await flush;
+    expect(flushed).toBe(true);
   });
 
   it('repairs a tick from the durable store when the socket frame never arrived', async () => {

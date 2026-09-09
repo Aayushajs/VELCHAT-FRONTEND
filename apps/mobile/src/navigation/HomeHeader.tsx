@@ -30,7 +30,6 @@ import { useProfileSummary } from '../features/user';
 import { HeaderMenu, type HeaderMenuItem } from './HeaderMenu';
 import { ProfilePeek } from './ProfilePeek';
 import type { RootStackParamList } from './types';
-import VELCHAT_ICON from '../design-system/assets/velchat-icon.png';
 
 // The rotating "active" halo around the avatar — a lively green even in the B&W theme.
 const RING_GREEN = '#25D366';
@@ -307,25 +306,12 @@ export function HomeHeader(): React.JSX.Element {
       >
         <View style={{ flex: 1 }}>
           {isChats ? (
-            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-              <Image
-                source={VELCHAT_ICON}
-                accessibilityLabel="VelChat"
-                style={{
-                  width: 31,
-                  height: 31,
-                  borderRadius: 8,
-                  marginRight: 9,
-                }}
-                resizeMode="contain"
-              />
-              <Text
-                variant="title"
-                style={{ fontSize: 22, color: t.colors.textPrimary }}
-              >
-                VelChat
-              </Text>
-            </View>
+            <Text
+              variant="title"
+              style={{ fontSize: 22, color: t.colors.textPrimary }}
+            >
+              VelChat
+            </Text>
           ) : (
             <Text variant="title" numberOfLines={1} style={{ fontSize: 22 }}>
               {tr(`tabs.${activeTab.toLowerCase()}`)}
