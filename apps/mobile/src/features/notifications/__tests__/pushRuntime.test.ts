@@ -19,8 +19,21 @@
 import type { PushPendingEvent } from '../../../infra';
 
 const mockListeners = new Set<(e: PushPendingEvent) => void>();
-const mockState: { queued: PushPendingEvent[]; accountId: string | undefined } =
-  { queued: [], accountId: 'me' };
+const mockState: {
+  queued: PushPendingEvent[];
+  accountId: string | undefined;
+  /** Milliseconds left on the access token. Large by default: no test needs a refresh. */
+  accessTokenMs: number;
+  refreshToken: string | undefined;
+  /** What the outbox still holds AFTER a flush — drives the second-pass behaviour. */
+  queuedAfterFlush: number;
+} = {
+  queued: [],
+  accountId: 'me',
+  accessTokenMs: 10 * 60_000,
+  refreshToken: 'refresh-token',
+  queuedAfterFlush: 0,
+};
 
 // Typed with a rest parameter so the mock factories below can forward `...unknown[]` into
 // them; a zero-arg signature makes that spread a type error.
@@ -32,6 +45,7 @@ const mockSetPushAvailable = jest.fn();
 const mockNoteInboundDelivered = jest.fn();
 const mockInitPush = jest.fn(async () => undefined);
 const mockSetNativeMute = jest.fn();
+const mockRefreshSession = jest.fn(async () => ({ status: 'ok', access: 'fresh' }));
 const mockSetConversationMute = jest.fn((..._a: unknown[]) =>
   Promise.resolve(undefined),
 );
@@ -62,6 +76,13 @@ jest.mock('../../../infra', () => ({
   syncPersonAvatars: () => undefined,
   observeConversations: () => ({ subscribe: () => ({ unsubscribe() {} }) }),
   getAccountId: () => mockState.accountId,
+  getRefreshToken: () => mockState.refreshToken,
+  accessTokenExpiresInMs: () => mockState.accessTokenMs,
+  refreshSession: () => mockRefreshSession(),
+  outboxStats: async () => ({
+    queued: mockState.queuedAfterFlush,
+    nextDueAt: null,
+  }),
 }));
 
 jest.mock('../../../domain/sync', () => ({
@@ -95,10 +116,57 @@ beforeEach(() => {
   mockListeners.clear();
   mockState.queued = [];
   mockState.accountId = 'me';
+  mockState.accessTokenMs = 10 * 60_000;
+  mockState.refreshToken = 'refresh-token';
+  mockState.queuedAfterFlush = 0;
   stopPushRuntime();
 });
 
 afterEach(() => stopPushRuntime());
+
+describe('pushRuntime — the wake window', () => {
+  it('refreshes an expired access token BEFORE sending', async () => {
+    // The bug this pins: the reply went out on a token that had already expired, so the wake
+    // window paid 401 -> refresh -> retry. On mobile data that chain did not always finish, the
+    // failure classified as transient — which pauses the whole outbox drain — and the reply left
+    // only when the user next opened the app.
+    mockState.accessTokenMs = 0;
+    mockState.queued = [{ type: 'reply', conversationId: 'c1', text: 'hi' }];
+
+    await runQueuedPushActions();
+
+    expect(mockRefreshSession).toHaveBeenCalledTimes(1);
+    expect(mockSendText).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not refresh a token with plenty of life left', async () => {
+    mockState.queued = [{ type: 'reply', conversationId: 'c1', text: 'hi' }];
+    await runQueuedPushActions();
+    expect(mockRefreshSession).not.toHaveBeenCalled();
+  });
+
+  it('does not try to refresh without a refresh token', async () => {
+    // Signed out. There is nothing to refresh with, and asking would only waste the window.
+    mockState.accessTokenMs = 0;
+    mockState.refreshToken = undefined;
+    await runQueuedPushActions();
+    expect(mockRefreshSession).not.toHaveBeenCalled();
+  });
+
+  it('flushes a second time when the outbox still holds work', async () => {
+    // One transient failure pauses the drain, so a single flush can leave the reply behind. The
+    // wake window is the only chance it gets before the next launch.
+    mockState.queuedAfterFlush = 1;
+    await runQueuedPushActions();
+    expect(mockFlushOutbox).toHaveBeenCalledTimes(2);
+  });
+
+  it('flushes once when the outbox drained', async () => {
+    mockState.queuedAfterFlush = 0;
+    await runQueuedPushActions();
+    expect(mockFlushOutbox).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('pushRuntime — a queued reply', () => {
   it('sends it through the ordinary send path and marks the chat read', async () => {

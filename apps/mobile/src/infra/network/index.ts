@@ -5,7 +5,7 @@
  * Dependency rule (§M3): UI → Feature → Domain → Infra. Never the reverse.
  */
 export { queryClient } from './queryClient';
-export { api, refreshAccessToken, warmBackend } from './client';
+export { api, refreshAccessToken, refreshSession, warmBackend } from './client';
 export {
   sendChatMessage,
   fetchMessagesAfter,
@@ -54,6 +54,7 @@ export {
   getAccountId,
   getPhone,
   hasSession,
+  accessTokenExpiresInMs,
   setTokens,
   clearSession,
   subscribeSession,

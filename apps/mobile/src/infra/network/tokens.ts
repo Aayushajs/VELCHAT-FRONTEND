@@ -84,6 +84,35 @@ export function hasSession(): boolean {
   return Boolean(getAccessToken());
 }
 
+/**
+ * Milliseconds until the access token expires: 0 when it is already expired or unreadable.
+ *
+ * Read locally, from the token we already parse for the account id. It exists for the case where
+ * finding out the hard way is too expensive: a process woken by a push has one bounded window to
+ * send a reply, and spending part of it on a request that is CERTAIN to 401 — then a refresh,
+ * then a retry — is how an inline reply ends up sending only once the user opens the app.
+ *
+ * Unverified, like the account-id read above, and safe for the same reason: it decides only
+ * whether to refresh early. A tampered value buys nothing; the server still checks the token.
+ */
+export function accessTokenExpiresInMs(now: number = Date.now()): number {
+  const token = kv.getString(KVKeys.accessToken);
+  if (!token) return 0;
+  const payload = token.split('.')[1];
+  if (!payload) return 0;
+  try {
+    const json = Buffer.from(
+      payload.replace(/-/g, '+').replace(/_/g, '/'),
+      'base64',
+    ).toString('utf8');
+    const exp = (JSON.parse(json) as Record<string, unknown>).exp;
+    if (typeof exp !== 'number') return 0;
+    return Math.max(0, exp * 1000 - now);
+  } catch {
+    return 0;
+  }
+}
+
 // ── session change notification ────────────────────────────────────────────────
 /**
  * Listeners for "a session appeared / went away".
