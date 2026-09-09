@@ -75,6 +75,17 @@ class VelChatMessagingService : FirebaseMessagingService() {
 
   private fun handleMessage(store: PushStore, data: Map<String, String>) {
     val conversationId = data["conversationId"]?.takeIf { it.isNotBlank() } ?: return
+    // Log the ARRIVAL, unconditionally.
+    //
+    // Everything here used to log only on failure, which made the most important question
+    // unanswerable from a device log: did the push reach the app at all? Silence meant either
+    // "never arrived" or "arrived and worked", and those need completely different fixes. No ids
+    // or content — the conversation is hashed and the body is only measured.
+    Log.i(
+        TAG,
+        "push received: conv=${conversationId.hashCode()} seq=${data["seq"]} " +
+            "kind=${data["kind"]} previewChars=${data["preview"]?.length ?: 0}",
+    )
     // Every FCM data value is a string on the wire, so `seq` arrives as "42". Comparing that
     // against a numeric watermark would never match — parse it once, here.
     val seq = data["seq"]?.toLongOrNull() ?: 0L
@@ -88,6 +99,7 @@ class VelChatMessagingService : FirebaseMessagingService() {
     // check for the one case a notification would genuinely be noise.
     val onScreen =
         PushBridge.isAppResumed(this) && store.activeConversationId() == conversationId
+    if (onScreen) Log.i(TAG, "notification skipped: this chat is on screen")
     if (!onScreen) {
       // Isolated on purpose. The ack below is the ONLY thing that can produce a second tick for
       // a closed app, and it runs after this — so anything that can throw while drawing a
@@ -96,7 +108,7 @@ class VelChatMessagingService : FirebaseMessagingService() {
       // Failing to notify is a visible annoyance; failing to acknowledge is the bug this whole
       // service exists to fix.
       try {
-        PushNotifications.showMessage(
+        val shown = PushNotifications.showMessage(
             this,
             store,
             conversationId,
@@ -107,6 +119,9 @@ class VelChatMessagingService : FirebaseMessagingService() {
             data["kind"],
             data["senderId"],
         )
+        // False means a deliberate early return — muted, notifications off, or a blocked
+        // channel. Indistinguishable from a crash without saying so.
+        if (!shown) Log.i(TAG, "notification NOT shown (muted / notifications off / channel)")
       } catch (e: Throwable) {
         Log.w(TAG, "notification post failed: ${e.javaClass.simpleName}")
       }

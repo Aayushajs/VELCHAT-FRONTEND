@@ -40,6 +40,13 @@ class VelChatPushModule(private val reactContext: ReactApplicationContext) :
     super.initialize()
     PushBridge.attach(reactContext)
     PushNotifications.ensureChannels(reactContext)
+    // A starting process is showing no chat yet, so any id left over from a previous run is a
+    // lie — and a dangerous one: `VelChatMessagingService` suppresses a notification for the
+    // conversation it names. The id is written when a chat opens and cleared when it closes, so
+    // a process killed with a chat open (or swiped away) left it set permanently, and every
+    // later push for THAT conversation was silently dropped while pushes for others appeared.
+    // ChatScreen re-sets it the moment it mounts.
+    store.setActiveConversation(null)
   }
 
   override fun invalidate() {
