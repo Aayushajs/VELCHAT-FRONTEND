@@ -153,6 +153,21 @@ export interface NativePushBinding {
    */
   setPersonNames(names: Readonly<Record<string, string>>): Promise<void>;
 
+  /**
+   * Mirror accountId -> photo URL, so a notification can show the sender face-first.
+   *
+   * Only the URL crosses: native downloads and shrinks the picture while the app is alive and
+   * caches it as a file. The process that draws a notification has no JS runtime and must do no
+   * network work — a photo cannot be allowed to delay the message behind it.
+   */
+  setPersonAvatars(avatars: Readonly<Record<string, string>>): Promise<void>;
+
+  /**
+   * Tell native which chat is on screen, so a push for THAT chat is the only one suppressed.
+   * `null` on leaving the chat re-enables notifications for it.
+   */
+  setActiveConversation(conversationId: string | null): Promise<void>;
+
   /** Keep the native mute in step with a pref the user set inside the app. 0 clears it. */
   setMuted(conversationId: string, untilMillis: number): Promise<void>;
 
@@ -168,6 +183,33 @@ export interface NativePushBinding {
 
   /** Drain the queue. The ONLY thing that empties it — callers must handle what they take. */
   takePendingEvents(): Promise<PushPendingEvent[]>;
+
+  /**
+   * Is the app exempt from battery optimisation?
+   *
+   * When it is not, Doze and the OEM power managers may withhold a high-priority data message
+   * entirely: FCM reports it delivered, the messaging service never runs, and the user gets
+   * neither a notification nor a second tick on the sender's side. Nothing in the app can
+   * observe that happening — this is the closest thing to an explanation available, which is
+   * why it is surfaced rather than guessed at.
+   */
+  /**
+   * Can a message notification actually be DISPLAYED — app-level and channel-level?
+   *
+   * The channel half is the one that hides: Android keeps a channel's importance forever once it
+   * exists and silently ignores later changes, so a channel that was ever blocked stays blocked
+   * while `areNotificationsEnabled()` still answers true. The notification then posts
+   * successfully and never appears.
+   */
+  areMessageNotificationsBlocked(): Promise<boolean>;
+
+  isIgnoringBatteryOptimizations(): Promise<boolean>;
+
+  /** Show the system prompt for that exemption. Resolves false if no screen could be opened. */
+  requestIgnoreBatteryOptimizations(): Promise<boolean>;
+
+  /** Open this app's own system settings page (where notifications and battery both live). */
+  openAppSettings(): Promise<boolean>;
 }
 
 /** The body `POST /notifications/endpoints` expects (backend `RegisterEndpointDto`). */

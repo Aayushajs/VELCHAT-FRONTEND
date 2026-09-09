@@ -12,6 +12,8 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
 import androidx.core.app.RemoteInput
+import androidx.core.graphics.drawable.IconCompat
+import android.util.Log
 import com.velchat.MainActivity
 import com.velchat.R
 
@@ -40,8 +42,22 @@ import com.velchat.R
  */
 internal object PushNotifications {
 
-  const val CHANNEL_MESSAGES = "velchat.messages.v1"
-  const val CHANNEL_CALLS = "velchat.calls.v1"
+  /**
+   * Channel ids carry a version, and bumping it is the ONLY way to change a channel.
+   *
+   * `createNotificationChannel` is create-or-ignore: once a channel exists, Android keeps the
+   * user's (or an OEM's) importance and blocked state forever and silently discards whatever the
+   * app passes on later calls. So a channel that was ever created blocked, or at low importance,
+   * stays that way — notifications post successfully and never appear, with no error anywhere.
+   *
+   * v2 because v1 was created by earlier builds of this app and cannot be trusted; `ensureChannels`
+   * deletes the old one so it does not linger in the user's settings as a dead entry.
+   */
+  const val CHANNEL_MESSAGES = "velchat.messages.v2"
+  const val CHANNEL_CALLS = "velchat.calls.v2"
+
+  /** Channels this app created in the past. Deleted on sight — see the note above. */
+  private val LEGACY_CHANNELS = listOf("velchat.messages.v1", "velchat.calls.v1")
 
   /** Bundling key. Android auto-bundles from 4 notifications; the explicit group + summary
    *  makes the collapsed state say "5 new messages" instead of listing five identical lines. */
@@ -89,8 +105,44 @@ internal object PushNotifications {
               setShowBadge(false)
             }
 
+    // Drop the previous generation first, so a v1 the user (or an OEM) had blocked does not sit
+    // in Settings alongside v2 looking like the live one.
+    for (legacy in LEGACY_CHANNELS) {
+      try {
+        manager.deleteNotificationChannel(legacy)
+      } catch (_: Throwable) {
+        // Nothing to do: a channel that cannot be deleted is one we no longer post to.
+      }
+    }
+
     manager.createNotificationChannel(messages)
     manager.createNotificationChannel(calls)
+  }
+
+  /**
+   * Will a message notification actually be shown?
+   *
+   * `areNotificationsEnabled()` is APP-level and answers true while the message CHANNEL is
+   * blocked — which posts successfully and displays nothing. Both have to be checked, and the
+   * channel one is the trap: it cannot be repaired by the app, only by the user or by moving to
+   * a new channel id.
+   */
+  fun messagesChannelBlocked(context: Context): Boolean {
+    if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return true
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
+    return try {
+      ensureChannels(context)
+      val ch =
+          NotificationManagerCompat.from(context).getNotificationChannel(CHANNEL_MESSAGES)
+              ?: return false // cannot tell — do not accuse the user of a setting
+      // NONE shows nothing at all. MIN shows no status-bar icon and no sound, which is
+      // indistinguishable from "broken" to a user waiting for a message — so both count as
+      // blocked for the purpose of telling them something is wrong.
+      ch.importance == NotificationManager.IMPORTANCE_NONE ||
+          ch.importance == NotificationManager.IMPORTANCE_MIN
+    } catch (_: Throwable) {
+      false
+    }
   }
 
   // ── posting ────────────────────────────────────────────────────────────────
@@ -134,34 +186,101 @@ internal object PushNotifications {
     val lines =
         store.appendLine(
             conversationId,
-            PushStore.Line(senderName ?: conversationName, body, System.currentTimeMillis()),
+            PushStore.Line(
+                senderName ?: conversationName,
+                body,
+                System.currentTimeMillis(),
+                senderId = senderId,
+            ),
         )
+    // Remembered so the notification can be REBUILT after an inline reply with actions that
+    // still acknowledge the right message — see `showOwnReply`.
+    store.setLastSeq(conversationId, seq)
 
     val id = notificationId(conversationId)
-    val builder =
-        NotificationCompat.Builder(context, CHANNEL_MESSAGES)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setColor(context.getColor(R.color.push_accent))
-            .setStyle(messagingStyle(context, conversationName, isGroup, lines))
-            // Set as well as styled: the lock screen, Wear, and some launchers read these
-            // directly and show nothing at all if only the style is populated.
-            .setContentTitle(conversationName)
-            .setContentText(if (isGroup && lines.size == 1) "${senderName}: $body" else body)
-            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-            .setWhen(System.currentTimeMillis())
-            .setShowWhen(true)
-            .setNumber(count)
-            .setGroup(GROUP_MESSAGES)
-            .setContentIntent(openConversationIntent(context, conversationId, id))
-            .setDeleteIntent(dismissIntent(context, conversationId, id))
-            .addAction(replyAction(context, conversationId, seq, id))
-            .addAction(markReadAction(context, conversationId, seq, id))
-            .addAction(muteAction(context, conversationId, id))
 
-    postSafely(context, id, builder.build())
-    postSummary(context, store)
+    // The ENTIRE rich build is inside the try, not just `build()`.
+    //
+    // It was not, and that made the fallback below dead code for exactly the failures its own
+    // comment named: `messagingStyle(...)`, `getColor(...)` and the four PendingIntents were all
+    // evaluated while assembling `builder`, BEFORE the try opened. A throw from any of them
+    // escaped to the caller's swallowing catch in VelChatMessagingService, so there was no
+    // notification, no fallback, and no explanation.
+    val posted =
+        try {
+          val builder =
+              NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+                  .setSmallIcon(R.drawable.ic_notification)
+                  .setColor(context.getColor(R.color.push_accent))
+                  .setStyle(messagingStyle(context, store, conversationName, isGroup, lines))
+                  // Set as well as styled: the lock screen, Wear, and some launchers read these
+                  // directly and show nothing at all if only the style is populated.
+                  .setContentTitle(conversationName)
+                  .setContentText(
+                      if (isGroup && lines.size == 1) "$senderName: $body" else body)
+                  // The COLLAPSED row does not draw the style's per-message faces, so the photo
+                  // has to be set here as well or it appears only once the user expands — which
+                  // is exactly when they no longer need help recognising who wrote.
+                  .apply {
+                    senderId?.let { PushAvatars.bitmap(store.personAvatarFile(it)) }?.let(
+                        ::setLargeIcon)
+                  }
+                  .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                  .setPriority(NotificationCompat.PRIORITY_HIGH)
+                  .setAutoCancel(true)
+                  .setWhen(System.currentTimeMillis())
+                  .setShowWhen(true)
+                  .setNumber(count)
+                  .setGroup(GROUP_MESSAGES)
+                  .setContentIntent(openConversationIntent(context, conversationId, id))
+                  .setDeleteIntent(dismissIntent(context, conversationId, id))
+                  .addAction(replyAction(context, conversationId, seq, id))
+                  .addAction(markReadAction(context, conversationId, seq, id))
+                  .addAction(muteAction(context, conversationId, id))
+          postSafely(context, id, builder.build())
+        } catch (e: Throwable) {
+          // The MESSAGE as well as the class. "NoClassDefFoundError" alone cost a build-and-test
+          // round trip to identify; the message names the class and answers it immediately. No
+          // content or ids can reach here — this is a builder failure, not a payload.
+          Log.w(
+              TAG,
+              "rich notification failed (${e.javaClass.simpleName}: ${e.message}); posting plain",
+          )
+          false
+        }
+
+    // A plain notification that appears beats a styled one that does not. This runs when the
+    // rich build threw AND when `notify()` itself refused — `postSafely` now reports which,
+    // instead of returning Unit and letting the caller assume success.
+    if (!posted) {
+      val plain =
+          try {
+            postSafely(
+                context,
+                id,
+                NotificationCompat.Builder(context, CHANNEL_MESSAGES)
+                    .setSmallIcon(R.drawable.ic_notification)
+                    .setContentTitle(conversationName)
+                    .setContentText(body)
+                    .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setAutoCancel(true)
+                    .setContentIntent(openConversationIntent(context, conversationId, id))
+                    .build(),
+            )
+          } catch (e: Throwable) {
+            Log.w(TAG, "plain notification failed too: ${e.javaClass.simpleName}")
+            false
+          }
+      if (!plain) return false
+    }
+
+    // Never let the summary take the message notification down with it — it is decoration.
+    try {
+      postSummary(context, store)
+    } catch (e: Throwable) {
+      Log.i(TAG, "group summary skipped: ${e.javaClass.simpleName}")
+    }
     return true
   }
 
@@ -174,6 +293,7 @@ internal object PushNotifications {
    */
   private fun messagingStyle(
       context: Context,
+      store: PushStore,
       conversationName: String,
       isGroup: Boolean,
       lines: List<PushStore.Line>,
@@ -181,6 +301,9 @@ internal object PushNotifications {
     val me = Person.Builder().setName(context.getString(R.string.push_you)).setKey("me").build()
     val style = NotificationCompat.MessagingStyle(me).setGroupConversation(isGroup)
     if (isGroup) style.conversationTitle = conversationName
+    // Photos are decoded ONCE per person, not once per line: a thread of ten messages from the
+    // same sender would otherwise decode the same file ten times on the push path.
+    val faces = HashMap<String, IconCompat?>()
     for (line in lines) {
       // A reply the user sent from the notification is attributed to THEM, so the thread reads
       // as a conversation rather than as the peer quoting the user back at themselves.
@@ -188,11 +311,33 @@ internal object PushNotifications {
           if (line.mine) me
           else {
             val name = line.sender ?: conversationName
-            Person.Builder().setName(name).setKey(name).build()
+            val builder = Person.Builder().setName(name).setKey(line.senderId ?: name)
+            line.senderId?.let { id ->
+              faces.getOrPut(id) { avatarIcon(store.personAvatarFile(id)) }?.let(builder::setIcon)
+            }
+            builder.build()
           }
       style.addMessage(line.text, line.at, person)
     }
     return style
+  }
+
+  /**
+   * The sender's photo as a notification icon, or null.
+   *
+   * The cached file is ALREADY a circle — `PushAvatars.circleCrop` shapes it once, when it is
+   * downloaded. So this hands the bitmap over as it is: `createWithAdaptiveBitmap` would apply
+   * the adaptive-icon mask on top, which keeps only the middle ~66% and visibly cut the face out
+   * of a portrait photo.
+   */
+  private fun avatarIcon(path: String?): IconCompat? {
+    val bitmap = PushAvatars.bitmap(path) ?: return null
+    return try {
+      IconCompat.createWithBitmap(bitmap)
+    } catch (e: Throwable) {
+      Log.i(TAG, "avatar icon failed: " + e.javaClass.simpleName)
+      null
+    }
   }
 
   /**
@@ -237,6 +382,12 @@ internal object PushNotifications {
    *
    * The real confirmation is the message appearing in the chat; this only has to stop the
    * notification looking like the reply was swallowed while the send is still in flight.
+   *
+   * It rebuilds the notification, so it must rebuild ALL of it. It did not: the actions were left
+   * off, and one reply therefore stripped Reply, Mark as read and Mute from the thread — the user
+   * answered once and then had to open the app to answer again, which is the entire thing these
+   * buttons exist to avoid. The seq the rebuilt actions carry comes from `PushStore.lastSeq`,
+   * because the reply itself does not know which message it is answering.
    */
   fun showOwnReply(context: Context, store: PushStore, conversationId: String, text: String) {
     if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return
@@ -251,13 +402,17 @@ internal object PushNotifications {
             PushStore.Line(null, text, System.currentTimeMillis(), mine = true),
         )
     val isGroup = lines.any { !it.mine && it.sender != null && it.sender != conversationName }
+    // What the actions will acknowledge. Zero is fine: `replyAction` still works (the reply
+    // carries its own text), and the receipt paths already refuse a non-positive seq rather than
+    // acknowledging something that does not exist.
+    val seq = store.lastSeq(conversationId)
 
     val id = notificationId(conversationId)
     val notification =
         NotificationCompat.Builder(context, CHANNEL_MESSAGES)
             .setSmallIcon(R.drawable.ic_notification)
             .setColor(context.getColor(R.color.push_accent))
-            .setStyle(messagingStyle(context, conversationName, isGroup, lines))
+            .setStyle(messagingStyle(context, store, conversationName, isGroup, lines))
             .setContentTitle(conversationName)
             .setContentText(text)
             .setSubText(context.getString(R.string.push_reply_sending))
@@ -270,6 +425,9 @@ internal object PushNotifications {
             .setGroup(GROUP_MESSAGES)
             .setContentIntent(openConversationIntent(context, conversationId, id))
             .setDeleteIntent(dismissIntent(context, conversationId, id))
+            .addAction(replyAction(context, conversationId, seq, id))
+            .addAction(markReadAction(context, conversationId, seq, id))
+            .addAction(muteAction(context, conversationId, id))
             .build()
     postSafely(context, id, notification)
   }
@@ -281,7 +439,8 @@ internal object PushNotifications {
    */
   private fun postSummary(context: Context, store: PushStore) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return // pre-N has no bundling
-    val active = groupedCount(context) ?: return
+    // Our own counters — see `PushStore.countedConversations` for why not the system's.
+    val active = store.countedConversations()
     if (active <= 1) {
       // A single conversation reads better on its own than under a summary.
       NotificationManagerCompat.from(context).cancel(SUMMARY_ID)
@@ -315,27 +474,9 @@ internal object PushNotifications {
     nm.cancel(notificationId(conversationId))
     // The summary must go too once it is the last thing left, or it strands as an empty group.
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-      if (groupedCount(context) == 0) nm.cancel(SUMMARY_ID)
+      if (store.countedConversations() == 0) nm.cancel(SUMMARY_ID)
     }
   }
-
-  /**
-   * How many per-conversation notifications this app currently has posted in the message group,
-   * or null when the system will not say.
-   *
-   * `getActiveNotifications()` reaches into the NotificationManager service, and several OEM
-   * builds throw from it rather than returning empty. Both callers are on paths that must not
-   * fail — one runs before the delivery ack in a killed-app wake, the other from a notification
-   * action — so "cannot tell" is answered with null and the summary is simply left alone.
-   */
-  private fun groupedCount(context: Context): Int? =
-      try {
-        NotificationManagerCompat.from(context).activeNotifications.count {
-          it.id != SUMMARY_ID && it.notification.group == GROUP_MESSAGES
-        }
-      } catch (_: Throwable) {
-        null
-      }
 
   fun cancelAll(context: Context, store: PushStore) {
     store.clearAllCounts()
@@ -356,14 +497,23 @@ internal object PushNotifications {
     return if (positive <= SUMMARY_ID) positive + SUMMARY_ID + 1 else positive
   }
 
-  private fun postSafely(context: Context, id: Int, notification: Notification) {
-    try {
-      NotificationManagerCompat.from(context).notify(id, notification)
-    } catch (_: SecurityException) {
-      // POST_NOTIFICATIONS revoked between the check above and here. Nothing to do, and
-      // certainly nothing worth crashing a background wake over.
-    }
-  }
+  /**
+   * Post, and report whether it actually happened.
+   *
+   * This used to return Unit and swallow `SecurityException` in silence, which made the caller's
+   * `try { postSafely(...); true }` hard-code success: a `notify()` that did nothing reported
+   * that it had, so the plain fallback never ran and no log said why the notification was
+   * missing. A refusal now returns false and is logged.
+   */
+  private fun postSafely(context: Context, id: Int, notification: Notification): Boolean =
+      try {
+        NotificationManagerCompat.from(context).notify(id, notification)
+        true
+      } catch (e: SecurityException) {
+        // POST_NOTIFICATIONS revoked between the check above and here.
+        Log.w(TAG, "notify() refused: ${e.javaClass.simpleName}")
+        false
+      }
 
   // ── intents ────────────────────────────────────────────────────────────────
 
@@ -487,6 +637,8 @@ internal object PushNotifications {
       } else {
         PendingIntent.FLAG_UPDATE_CURRENT
       }
+
+  private const val TAG = "VelChatPushNotify"
 
   private const val ACTION_OPEN = 0
   private const val ACTION_REPLY = 1

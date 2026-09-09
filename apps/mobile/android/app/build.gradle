@@ -226,6 +226,28 @@ android {
         // This resource is the hook the library checks first; point it at the real namespace.
         resValue "string", "build_config_package", "com.velchat"
     }
+    // One APK per ABI (§R5 — the reference device is a 3 GB phone, and download size is the
+    // first thing it pays).
+    //
+    // The universal build shipped FOUR copies of every native library: 64 MB of `.so` inside a
+    // 79 MB APK, of which a given phone can execute exactly one set. Splitting it is the largest
+    // single size win available and costs nothing at runtime.
+    //
+    // `x86_64` stays because that is what the emulator runs, and a build that cannot be installed
+    // on the emulator cannot be tested here. `universalApk` stays too: it is the one to hand
+    // someone whose device you do not know.
+    //
+    // NOTE for a future Play upload: these APKs all carry the same `versionCode`, which a store
+    // listing cannot accept. Give each ABI an offset then, or switch to an App Bundle and let
+    // Play do the splitting.
+    splits {
+        abi {
+            enable true
+            reset()
+            include "arm64-v8a", "armeabi-v7a", "x86_64"
+            universalApk true
+        }
+    }
     // §M1/§F1: distinct bundle IDs per env so all three install side by side.
     // dev -> com.velchat.dev, stage -> com.velchat.stage, prod -> com.velchat
     flavorDimensions "env"

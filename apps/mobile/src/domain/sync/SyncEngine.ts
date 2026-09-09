@@ -291,11 +291,23 @@ class SyncEngine {
         this.clearSuspendTimer();
         this.suspended = false;
         this.onForeground();
+        // Presence follows the FOREGROUND, not the socket. The server uses it to decide whether
+        // a push would be noise, so it has to be re-announced here — the socket may well have
+        // stayed open across the switch, in which case nothing else would restart it.
+        this.startSelfPresence();
       } else {
         // Backgrounding is the natural reporting boundary: a session's numbers, emitted once,
         // where they cost nothing. This must NOT live inside the suspend timer — that is gated
         // on push being available, so the snapshot would never fire while push is missing.
         logLatencySnapshot();
+        // Announce offline IMMEDIATELY, before and independently of the socket suspend.
+        //
+        // Waiting for the suspend left a 30-second window in which a backgrounded user still
+        // counted as online and received no notification — and when push was unavailable the
+        // suspend never ran at all, so that window was the rest of the session. Presence is
+        // about ATTENTION, not connectivity: the moment the app is not in front of the user, a
+        // message deserves a notification.
+        this.stopSelfPresence();
         this.scheduleSuspend();
       }
     });
@@ -1258,8 +1270,11 @@ class SyncEngine {
     // Owned interval (§M7): refreshes inside the server's 30s TTL, disposed with the socket.
     this.presenceTimer = setInterval(() => {
       const uid = getAccountId();
+      const dev = getDeviceId();
       if (!uid) return;
-      void presenceHeartbeat(uid).catch(() => undefined);
+      // The device id lets a beat restore a presence key that already lapsed, instead of only
+      // extending one that survived — see `presenceHeartbeat`.
+      void presenceHeartbeat(uid, dev ?? undefined).catch(() => undefined);
     }, PRESENCE_HEARTBEAT_MS);
   }
 

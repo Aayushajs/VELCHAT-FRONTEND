@@ -4,6 +4,7 @@
  * once; the MP2 outbox transmits + reconciles later.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AppState } from 'react-native';
 import {
   observeMessages,
   getAccountId,
@@ -11,6 +12,7 @@ import {
   MESSAGE_PAGE,
   Message,
   clearConversationNotification,
+  setActiveConversationForPush,
 } from '../../../infra';
 import { syncEngine } from '../../../domain/sync';
 
@@ -70,6 +72,16 @@ export function useMessages(conversationId: string): {
     // still there after a notification TAP, because tapping opens the app without clearing the
     // stacked "3 new messages" counter behind it.
     clearConversationNotification(conversationId);
+    // Native suppresses a push only for the chat on screen, so it has to be told which
+    // one that is — and told again (null) on leaving, or this chat stays silent.
+    setActiveConversationForPush(conversationId);
+    // Suppression must track what is actually VISIBLE, not merely what was last opened. A
+    // backgrounded app is showing nothing, so the id is withdrawn on leaving the foreground and
+    // re-asserted on return — otherwise a chat left open behind a locked screen swallows every
+    // notification for itself.
+    const appStateSub = AppState.addEventListener('change', state => {
+      setActiveConversationForPush(state === 'active' ? conversationId : null);
+    });
     let sub: { unsubscribe: () => void } | undefined;
     try {
       sub = observeMessages(conversationId, limit).subscribe(setMessages);
@@ -77,8 +89,10 @@ export function useMessages(conversationId: string): {
       setMessages([]);
     }
     return () => {
+      appStateSub.remove();
       sub?.unsubscribe();
       syncEngine.setActiveConversation(null);
+      setActiveConversationForPush(null);
     };
   }, [conversationId, meId, limit]);
   return { messages, meId, loadOlder };

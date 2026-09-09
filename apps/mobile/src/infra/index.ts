@@ -8,6 +8,7 @@ export {
   queryClient,
   api,
   refreshAccessToken,
+  refreshSession,
   warmBackend,
   sendChatMessage,
   fetchMessagesAfter,
@@ -33,6 +34,7 @@ export {
   getAccountId,
   getPhone,
   hasSession,
+  accessTokenExpiresInMs,
   setTokens,
   clearSession,
   subscribeSession,
@@ -189,9 +191,14 @@ export {
   drainPendingEvents,
   syncConversationNames,
   syncPersonNames,
+  syncPersonAvatars,
   setNativeMute,
   clearConversationNotification,
+  setActiveConversationForPush,
+  getPushBlocker,
+  resolvePushBlocker,
 } from './push';
+export type { PushBlocker } from './push';
 export type {
   PushMessage,
   PushPendingEvent,

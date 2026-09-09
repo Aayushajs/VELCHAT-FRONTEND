@@ -37,8 +37,18 @@ interface VelChatPushNativeModule {
   clearSession(): Promise<void>;
   setConversationNames(names: Record<string, string>): Promise<void>;
   setPersonNames(names: Record<string, string>): Promise<void>;
+  /**
+   * Mirror accountId -> photo URL. Native caches the picture to a file while the app is alive,
+   * so the push path only ever decodes a local file — it cannot fetch anything.
+   */
+  setPersonAvatars(avatars: Record<string, string>): Promise<void>;
+  setActiveConversation(conversationId: string | null): Promise<void>;
   setMuted(conversationId: string, untilMillis: number): Promise<void>;
   takePendingEvents(): Promise<unknown>;
+  areMessageNotificationsBlocked(): Promise<boolean>;
+  isIgnoringBatteryOptimizations(): Promise<boolean>;
+  requestIgnoreBatteryOptimizations(): Promise<boolean>;
+  openAppNotificationSettings(): Promise<boolean>;
   /** Required by NativeEventEmitter; no-ops on the native side. */
   addListener(eventName: string): void;
   removeListeners(count: number): void;
@@ -115,10 +125,17 @@ const unsupportedBinding: NativePushBinding = {
   clearSession: () => Promise.resolve(),
   setConversationNames: () => Promise.resolve(),
   setPersonNames: () => Promise.resolve(),
+  setPersonAvatars: () => Promise.resolve(),
+  setActiveConversation: () => Promise.resolve(),
   setMuted: () => Promise.resolve(),
   clearConversationNotification: () => Promise.resolve(),
   onPendingEvents: () => () => undefined,
   takePendingEvents: () => Promise.resolve([]),
+  areMessageNotificationsBlocked: () => Promise.resolve(false),
+  // `true` so a platform without the concept never nags the user about it.
+  isIgnoringBatteryOptimizations: () => Promise.resolve(true),
+  requestIgnoreBatteryOptimizations: () => Promise.resolve(false),
+  openAppSettings: () => Promise.resolve(false),
 };
 
 const androidBinding = (mod: VelChatPushNativeModule): NativePushBinding => ({
@@ -217,6 +234,24 @@ const androidBinding = (mod: VelChatPushNativeModule): NativePushBinding => ({
     }
   },
 
+  async setPersonAvatars(avatars) {
+    try {
+      await mod.setPersonAvatars({ ...avatars });
+    } catch {
+      // The notification keeps its letter avatar. A picture is the last thing worth logging per
+      // chat-list change.
+    }
+  },
+
+  async setActiveConversation(conversationId) {
+    try {
+      await mod.setActiveConversation(conversationId);
+    } catch {
+      // Worst case a notification is posted for the chat already on screen. Not worth a log line
+      // on an effect that runs every time a chat opens.
+    }
+  },
+
   async setMuted(conversationId, untilMillis) {
     try {
       await mod.setMuted(conversationId, untilMillis);
@@ -238,6 +273,42 @@ const androidBinding = (mod: VelChatPushNativeModule): NativePushBinding => ({
     if (!em) return () => undefined;
     const sub = em.addListener(EVENT_PENDING, () => cb());
     return () => sub.remove();
+  },
+
+  async areMessageNotificationsBlocked() {
+    try {
+      return await mod.areMessageNotificationsBlocked();
+    } catch {
+      // Unknown is reported as NOT blocked: telling the user to change a setting that is already
+      // correct is worse than staying quiet.
+      return false;
+    }
+  },
+
+  async isIgnoringBatteryOptimizations() {
+    try {
+      return await mod.isIgnoringBatteryOptimizations();
+    } catch {
+      // Unknown is reported as EXEMPT: a false alarm that tells the user to change a setting
+      // they have already changed is worse than staying quiet.
+      return true;
+    }
+  },
+
+  async requestIgnoreBatteryOptimizations() {
+    try {
+      return await mod.requestIgnoreBatteryOptimizations();
+    } catch {
+      return false;
+    }
+  },
+
+  async openAppSettings() {
+    try {
+      return await mod.openAppNotificationSettings();
+    } catch {
+      return false;
+    }
   },
 
   async takePendingEvents() {

@@ -19,6 +19,7 @@ import {
 } from '../../../design-system';
 import { useTypingUser } from '../../../core';
 import type { RootStackParamList } from '../../../navigation/types';
+import { PushBlockerBanner } from '../../notifications';
 import {
   useConversations,
   type ConversationRowVM,
@@ -233,6 +234,10 @@ export function ChatsList(): React.JSX.Element {
 
   return (
     <View style={{ flex: 1, backgroundColor: t.colors.bgBase }}>
+      {/* Above the list, and above the empty state too: a user with no chats yet is exactly the
+          one who needs to be told notifications will not reach them. Renders nothing when there
+          is nothing wrong. */}
+      <PushBlockerBanner />
       {/* Nothing until the first DB emission — an ungated empty state flashes "no chats
           yet" on every cold start / tab mount before the rows land. */}
       {rows.length > 0 ? (

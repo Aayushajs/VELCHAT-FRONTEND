@@ -50,3 +50,7 @@ metro-cache/
 **/fastlane/Preview.html
 **/fastlane/screenshots
 **/fastlane/test_output
+
+# Built APKs. Release artefacts, not source — and a 31MB binary per build would make every
+# clone carry the history of every test build.
+apk-out/

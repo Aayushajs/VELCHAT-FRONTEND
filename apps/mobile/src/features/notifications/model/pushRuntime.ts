@@ -33,7 +33,12 @@ import {
   unregisterPush,
   syncConversationNames,
   syncPersonNames,
+  syncPersonAvatars,
   observeConversations,
+  outboxStats,
+  refreshSession,
+  getRefreshToken,
+  accessTokenExpiresInMs,
   subscribeSession,
   type PushPendingEvent,
 } from '../../../infra';
@@ -42,6 +47,20 @@ import { setConversationMute } from '../api/prefs';
 
 /** How many conversation names to mirror natively. Bounded — this is a notification title. */
 const NAME_MIRROR_LIMIT = 200;
+
+/**
+ * Refresh the session before acting if the access token has less than this left.
+ *
+ * Not a guess at clock skew — it is the cost of being wrong. A token with a few seconds on it
+ * expires mid-request, and the woken process learns that from a 401 it cannot afford.
+ */
+const ACCESS_TOKEN_MARGIN_MS = 60_000;
+
+/**
+ * How long to wait before the second flush. Long enough for a radio that was asleep when the
+ * push landed to have finished attaching, short enough to stay inside the wake window.
+ */
+const RETRY_FLUSH_DELAY_MS = 1_500;
 
 let unsubEvents: (() => void) | null = null;
 let unsubAvailability: (() => void) | null = null;
@@ -160,6 +179,7 @@ function startNameMirror(): void {
     namesSub = observeConversations(NAME_MIRROR_LIMIT).subscribe(rows => {
       const names: Record<string, string> = {};
       const people: Record<string, string> = {};
+      const faces: Record<string, string> = {};
       for (const row of rows) {
         const name = row.name?.trim();
         if (!name) continue;
@@ -168,9 +188,14 @@ function startNameMirror(): void {
         // what lets a notification attribute the message to a sender rather than to nobody.
         // Group members are not covered here and fall back to the conversation's own name.
         if (row.peerId) people[row.peerId] = name;
+        // The same row already carries the peer photo the chat list draws, so mirroring it costs
+        // one more map and no extra query. Native caches it to a file from here — the push path
+        // cannot fetch anything.
+        if (row.peerId && row.peerAvatarUrl) faces[row.peerId] = row.peerAvatarUrl;
       }
       syncConversationNames(names);
       syncPersonNames(people);
+      syncPersonAvatars(faces);
     });
   } catch {
     // No DB yet (first launch, before the adapter opens). Notifications fall back to a generic
@@ -239,8 +264,53 @@ async function handlePushEvent(event: PushPendingEvent): Promise<void> {
  */
 export async function runQueuedPushActions(): Promise<void> {
   installEventHandler();
+  // BEFORE anything is sent. A woken process gets one bounded window, and an access token that
+  // has already expired turns the reply into 401 -> refresh -> retry inside it. On a phone on
+  // mobile data that chain does not always finish: the failure classifies as transient, which
+  // PAUSES the outbox drain, and the reply then leaves only when the user next opens the app —
+  // which is exactly what a reply button is supposed to save them from. Refreshing first spends
+  // one round trip instead of three.
+  await refreshIfExpiring();
   await drainPendingEvents();
   // `allSettled`: one failed handler must not abandon the others, and each already logs itself.
   await Promise.allSettled([...inflight]);
   await syncEngine.flushOutboxNow();
+
+  // One more pass, if anything is still queued.
+  //
+  // A single transient failure pauses the whole drain (`sendFailurePolicy`), so without this the
+  // reply waits for the next launch. The retry is bounded and cheap: it runs only when something
+  // is actually still queued, and the wake window has room for it.
+  try {
+    const stats = await outboxStats();
+    if (stats.queued > 0) {
+      log.info('push: outbox still has work after the first flush', {
+        queued: stats.queued,
+      });
+      await new Promise(resolve => setTimeout(resolve, RETRY_FLUSH_DELAY_MS));
+      await syncEngine.flushOutboxNow();
+    }
+  } catch (err) {
+    log.info('push: could not re-check the outbox', { reason: String(err) });
+  }
+}
+
+/**
+ * Refresh the session if the access token is gone or about to be.
+ *
+ * The margin is generous on purpose: a token with four seconds left will expire mid-request, and
+ * the wake window cannot afford to find that out from the server.
+ */
+async function refreshIfExpiring(): Promise<void> {
+  if (!getRefreshToken()) return; // signed out, or nothing to refresh with
+  if (accessTokenExpiresInMs() > ACCESS_TOKEN_MARGIN_MS) return;
+  try {
+    const outcome = await refreshSession();
+    log.info('push: refreshed the session before acting', {
+      outcome: outcome.status,
+    });
+  } catch (err) {
+    // Not fatal. The send still tries, and the interceptor still has its own 401 path.
+    log.info('push: pre-emptive refresh failed', { reason: String(err) });
+  }
 }

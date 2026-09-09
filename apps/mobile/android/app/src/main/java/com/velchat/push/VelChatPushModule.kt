@@ -1,5 +1,9 @@
 package com.velchat.push
 
+import android.content.Intent
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -36,6 +40,13 @@ class VelChatPushModule(private val reactContext: ReactApplicationContext) :
     super.initialize()
     PushBridge.attach(reactContext)
     PushNotifications.ensureChannels(reactContext)
+    // A starting process is showing no chat yet, so any id left over from a previous run is a
+    // lie — and a dangerous one: `VelChatMessagingService` suppresses a notification for the
+    // conversation it names. The id is written when a chat opens and cleared when it closes, so
+    // a process killed with a chat open (or swiped away) left it set permanently, and every
+    // later push for THAT conversation was silently dropped while pushes for others appeared.
+    // ChatScreen re-sets it the moment it mounts.
+    store.setActiveConversation(null)
   }
 
   override fun invalidate() {
@@ -151,6 +162,21 @@ class VelChatPushModule(private val reactContext: ReactApplicationContext) :
     promise.resolve(null)
   }
 
+  /**
+   * Mirror `accountId -> photo URL` so a notification can show the sender's face.
+   *
+   * Resolves immediately: the download it starts is deliberately not awaited. JS calls this from
+   * the chat-list observer, and a photo is worth nothing to a caller that is only passing through
+   * — while a promise that waited on the network would make every chat-list change hold a bridge
+   * call open. The photo appears on the next notification instead, which is soon enough for
+   * something the user has not asked for yet.
+   */
+  @ReactMethod
+  fun setPersonAvatars(avatars: ReadableMap, promise: Promise) {
+    PushAvatars.mirror(reactApplicationContext, store, toStringMap(avatars))
+    promise.resolve(null)
+  }
+
   private fun toStringMap(names: ReadableMap): Map<String, String> {
     val map = HashMap<String, String>()
     val it = names.keySetIterator()
@@ -159,6 +185,16 @@ class VelChatPushModule(private val reactContext: ReactApplicationContext) :
       map[key] = names.getString(key) ?: ""
     }
     return map
+  }
+
+  /**
+   * Tell native which chat is on screen, so a push for THAT chat is the only one suppressed.
+   * Passing null (on leaving the chat) is what re-enables notifications for it.
+   */
+  @ReactMethod
+  fun setActiveConversation(conversationId: String?, promise: Promise) {
+    store.setActiveConversation(conversationId?.takeIf { it.isNotBlank() })
+    promise.resolve(null)
   }
 
   /** Keep the native mute in step with the server-side pref the user set inside the app. */
@@ -202,6 +238,93 @@ class VelChatPushModule(private val reactContext: ReactApplicationContext) :
     }
     promise.resolve(out)
   }
+
+  /**
+   * Are message notifications actually displayable — app-level AND channel-level?
+   *
+   * The channel half is the one that hides: `areNotificationsEnabled()` answers true while the
+   * message channel is blocked, so the notification posts and nothing appears.
+   */
+  @ReactMethod
+  fun areMessageNotificationsBlocked(promise: Promise) {
+    promise.resolve(
+        try {
+          PushNotifications.messagesChannelBlocked(reactContext)
+        } catch (_: Throwable) {
+          false
+        })
+  }
+
+  /**
+   * Is this app exempt from battery optimisation?
+   *
+   * When it is not, Doze and the OEM power managers are free to withhold a high-priority data
+   * message: FCM reports it delivered, `VelChatMessagingService` never runs, and the user gets
+   * neither a notification nor a second tick on the sender's side. Since nothing in the app can
+   * observe that happening, the exemption state is the closest thing to an explanation available
+   * — so it is reported rather than guessed at.
+   */
+  @ReactMethod
+  fun isIgnoringBatteryOptimizations(promise: Promise) {
+    promise.resolve(
+        try {
+          val pm = reactContext.getSystemService(PowerManager::class.java)
+          pm?.isIgnoringBatteryOptimizations(reactContext.packageName) ?: false
+        } catch (_: Throwable) {
+          false
+        })
+  }
+
+  /**
+   * Open the system prompt asking for that exemption.
+   *
+   * `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` shows a dialog the user accepts once. It is
+   * NOT silent and must be triggered by a deliberate user action; Play forbids nagging. Resolves
+   * false when the intent cannot be shown (no activity, or an OEM that removed the screen).
+   */
+  @ReactMethod
+  fun requestIgnoreBatteryOptimizations(promise: Promise) {
+    try {
+      val pkg = reactContext.packageName
+      val pm = reactContext.getSystemService(PowerManager::class.java)
+      if (pm?.isIgnoringBatteryOptimizations(pkg) == true) {
+        promise.resolve(true)
+        return
+      }
+      val intent =
+          Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            data = Uri.parse("package:$pkg")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          }
+      val activity = reactContext.currentActivity
+      if (activity != null) activity.startActivity(intent) else reactContext.startActivity(intent)
+      promise.resolve(true)
+    } catch (_: Throwable) {
+      // Some OEM builds remove this screen entirely. Falling back to the app's own settings page
+      // is better than a dead button.
+      promise.resolve(openAppSettings())
+    }
+  }
+
+  /** The app's own system settings page — where notifications and battery both live. */
+  @ReactMethod
+  fun openAppNotificationSettings(promise: Promise) {
+    promise.resolve(openAppSettings())
+  }
+
+  private fun openAppSettings(): Boolean =
+      try {
+        val intent =
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+              data = Uri.parse("package:${reactContext.packageName}")
+              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        val activity = reactContext.currentActivity
+        if (activity != null) activity.startActivity(intent) else reactContext.startActivity(intent)
+        true
+      } catch (_: Throwable) {
+        false
+      }
 
   /** Required by `NativeEventEmitter`; the emitter is driven from {@link PushBridge}. */
   @ReactMethod fun addListener(@Suppress("UNUSED_PARAMETER") eventName: String) = Unit

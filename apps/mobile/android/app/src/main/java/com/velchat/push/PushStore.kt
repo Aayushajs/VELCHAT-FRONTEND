@@ -91,6 +91,9 @@ internal class PushStore(context: Context) {
         .remove(KEY_MUTED)
         .remove(KEY_PENDING)
         .remove(KEY_COUNTS)
+        .remove(KEY_ACTIVE_CONVO)
+        .remove(KEY_AVATARS)
+        .remove(KEY_LAST_SEQ)
         .commit()
   }
 
@@ -123,6 +126,61 @@ internal class PushStore(context: Context) {
 
   fun putPersonNames(names: Map<String, String>) = putNames(KEY_PEOPLE, names)
 
+  // ── sender photos ──────────────────────────────────────────────────────────
+
+  /**
+   * `accountId -> { url, file }` for the sender photo shown in a notification.
+   *
+   * The FILE is what matters: a notification posted by a JS-less process cannot go and fetch a
+   * picture — the whole reason the ack is on a time budget is that network work inside the FCM
+   * callback stalls every message behind it. So the download happens while the app is alive and
+   * mirroring names, and the push path only ever decodes a local file.
+   *
+   * The URL is kept beside it purely to answer "is this still the same photo?" — media URLs are
+   * signed and rotate, so comparing them is how a changed avatar gets re-fetched and an
+   * unchanged one costs nothing.
+   */
+  fun personAvatarFile(accountId: String): String? =
+      readJson(KEY_AVATARS).optJSONObject(accountId)?.optString("file", "")?.takeIf {
+        it.isNotBlank()
+      }
+
+  /** The URL the cached photo came from, so a caller can tell whether it needs refreshing. */
+  fun personAvatarUrl(accountId: String): String? =
+      readJson(KEY_AVATARS).optJSONObject(accountId)?.optString("url", "")?.takeIf {
+        it.isNotBlank()
+      }
+
+  fun putPersonAvatar(accountId: String, url: String, file: String) {
+    if (accountId.isBlank()) return
+    val all = readJson(KEY_AVATARS)
+    all.put(accountId, JSONObject().put("url", url).put("file", file))
+    trimOldest(all, MAX_NAMES)
+    prefs.edit().putString(KEY_AVATARS, all.toString()).apply()
+  }
+
+  // ── the last seq we notified about ─────────────────────────────────────────
+
+  /**
+   * The highest `seq` a notification for this conversation was built from.
+   *
+   * Needed because a notification is REBUILT after the user replies inline, and its actions carry
+   * the seq they acknowledge. Without remembering it, the rebuilt notification either loses its
+   * buttons or carries a meaningless `0` — and a Mark-as-read that acknowledges nothing is worse
+   * than no button at all.
+   */
+  fun lastSeq(conversationId: String): Long =
+      readJson(KEY_LAST_SEQ).optLong(conversationId, 0L)
+
+  fun setLastSeq(conversationId: String, seq: Long) {
+    if (conversationId.isBlank() || seq <= 0L) return
+    val all = readJson(KEY_LAST_SEQ)
+    if (all.optLong(conversationId, 0L) >= seq) return // watermarks only move forward
+    all.put(conversationId, seq)
+    trimOldest(all, MAX_NAMES)
+    prefs.edit().putString(KEY_LAST_SEQ, all.toString()).apply()
+  }
+
   private fun readName(key: String, id: String): String? =
       readJson(key).optString(id, "").takeIf { it.isNotBlank() }
 
@@ -133,14 +191,24 @@ internal class PushStore(context: Context) {
       if (id.isBlank()) continue
       if (name.isBlank()) merged.remove(id) else merged.put(id, name)
     }
-    // Trim oldest-first. JSONObject preserves insertion order in practice; when it does not, we
-    // drop an arbitrary excess entry, which costs a generic notification title and nothing else.
-    while (merged.length() > MAX_NAMES) {
-      val it = merged.keys()
-      if (!it.hasNext()) break
-      merged.remove(it.next())
-    }
+    trimOldest(merged, MAX_NAMES)
     prefs.edit().putString(key, merged.toString()).apply()
+  }
+
+  /**
+   * Keep a mirrored map bounded, oldest-first.
+   *
+   * `JSONObject` preserves insertion order in practice; when it does not, an arbitrary excess
+   * entry is dropped instead — which costs one generic notification title and nothing else. These
+   * maps are a notification nicety and must never grow into a real cache (§M: no unbounded
+   * caches).
+   */
+  private fun trimOldest(map: JSONObject, max: Int) {
+    while (map.length() > max) {
+      val keys = map.keys()
+      if (!keys.hasNext()) break
+      map.remove(keys.next())
+    }
   }
 
   // ── the lines shown inside one conversation's notification ─────────────────
@@ -157,6 +225,12 @@ internal class PushStore(context: Context) {
       val text: String,
       val at: Long,
       val mine: Boolean = false,
+      /**
+       * Who sent it, by account id. Carried beside the display name because the sender PHOTO is
+       * cached by id, and in a group each line can be a different person — resolving the photo
+       * from the conversation instead would put one member's face on everybody's messages.
+       */
+      val senderId: String? = null,
   )
 
   /**
@@ -179,7 +253,8 @@ internal class PushStore(context: Context) {
             .put("s", line.sender ?: JSONObject.NULL)
             .put("t", line.text)
             .put("at", line.at)
-            .put("me", line.mine))
+            .put("me", line.mine)
+            .put("sid", line.senderId ?: JSONObject.NULL))
     while (existing.length() > MAX_LINES) existing.remove(0)
     all.put(conversationId, existing)
     while (all.length() > MAX_LINE_CONVOS) {
@@ -219,9 +294,30 @@ internal class PushStore(context: Context) {
               text,
               o.optLong("at", 0L),
               o.optBoolean("me", false),
+              o.optString("sid", "").takeIf { it.isNotBlank() },
           ))
     }
     return out
+  }
+
+  // ── what the user is looking at ────────────────────────────────────────────
+
+  /**
+   * The conversation currently open on screen, mirrored from JS, or null.
+   *
+   * This is what makes suppression correct. Suppressing on "the app is resumed" alone was wrong
+   * in two ways: a user reading chat A got no notification for a message in chat B, and a user
+   * whose socket had quietly died got neither the message nor a notification — the app looked
+   * simply broken. Suppress only for the chat they are actually reading.
+   */
+  fun activeConversationId(): String? =
+      prefs.getString(KEY_ACTIVE_CONVO, null)?.takeIf { it.isNotBlank() }
+
+  fun setActiveConversation(conversationId: String?) {
+    // `commit()`: a push can arrive in the same instant the user opens a chat, and reading a
+    // stale value here posts a notification for the conversation already on screen.
+    @Suppress("ApplySharedPref")
+    prefs.edit().putString(KEY_ACTIVE_CONVO, conversationId).commit()
   }
 
   // ── mute ───────────────────────────────────────────────────────────────────
@@ -254,6 +350,25 @@ internal class PushStore(context: Context) {
     counts.put(conversationId, next)
     prefs.edit().putString(KEY_COUNTS, counts.toString()).apply()
     return next
+  }
+
+  /**
+   * How many conversations currently have a notification of ours on screen.
+   *
+   * Derived from our OWN counters rather than `NotificationManagerCompat.activeNotifications`,
+   * because `notify()` is asynchronous: a read taken immediately after posting routinely does
+   * not include the notification just posted, so the group summary was computed from a value
+   * that was wrong most of the time — and a stale summary can be the only thing the user sees.
+   * These counters are written synchronously by `bumpCount`/`clearCount`, so they cannot race.
+   */
+  fun countedConversations(): Int {
+    val counts = readJson(KEY_COUNTS)
+    var n = 0
+    val keys = counts.keys()
+    while (keys.hasNext()) {
+      if (counts.optInt(keys.next(), 0) > 0) n++
+    }
+    return n
   }
 
   fun clearCount(conversationId: String) {
@@ -320,6 +435,12 @@ internal class PushStore(context: Context) {
     private const val KEY_MUTED = "muted"
     private const val KEY_COUNTS = "counts"
     private const val KEY_PENDING = "pending"
+    private const val KEY_ACTIVE_CONVO = "activeConvo"
+    // v2: the cached files changed SHAPE (square -> pre-masked circle), and the freshness check
+    // is by URL, so an unchanged URL would have gone on serving the old square crops forever.
+    // A new key retires them without needing a migration.
+    private const val KEY_AVATARS = "avatars.v2"
+    private const val KEY_LAST_SEQ = "lastSeq"
 
     private const val MAX_NAMES = 300
     private const val MAX_PENDING = 64

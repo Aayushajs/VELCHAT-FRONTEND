@@ -88,9 +88,16 @@ export async function presenceOffline(
   await api.post('/presence/offline', { userId, deviceId });
 }
 
-/** Refresh our online TTL. Must run more often than {@link PRESENCE_ONLINE_TTL_MS}. */
-export async function presenceHeartbeat(userId: string): Promise<void> {
-  await api.post('/presence/heartbeat', { userId });
+/**
+ * Refresh our online TTL. Must run more often than {@link PRESENCE_ONLINE_TTL_MS}.
+ *
+ * The device id is sent so the server can RE-ADD us if our presence key already lapsed. A beat
+ * that only extended a TTL could not recover from one late beat — and one late beat is normal on
+ * a phone, where a timer can be throttled or the radio can be asleep. Without this the account
+ * stayed offline for the rest of the session with the app wide open.
+ */
+export async function presenceHeartbeat(userId: string, deviceId?: string): Promise<void> {
+  await api.post('/presence/heartbeat', deviceId ? { userId, deviceId } : { userId });
 }
 
 export { normalizePresenceEvent } from './presenceShape';
