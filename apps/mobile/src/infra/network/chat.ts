@@ -261,10 +261,17 @@ export async function fetchPeerReceipts(
     for (const row of rows) {
       if (!row || typeof row !== 'object') continue;
       const r = row as Record<string, unknown>;
-      const state = r.state === 'read' ? 'read' : r.state === 'delivered' ? 'delivered' : null;
-      const upToSeq = typeof r.upToSeq === 'number' ? r.upToSeq : Number(r.upToSeq);
+      const state =
+        r.state === 'read'
+          ? 'read'
+          : r.state === 'delivered'
+            ? 'delivered'
+            : null;
+      const upToSeq =
+        typeof r.upToSeq === 'number' ? r.upToSeq : Number(r.upToSeq);
       const userId = typeof r.userId === 'string' ? r.userId : '';
-      if (!state || !userId || !Number.isFinite(upToSeq) || upToSeq <= 0) continue;
+      if (!state || !userId || !Number.isFinite(upToSeq) || upToSeq <= 0)
+        continue;
       out.push({ userId, state, upToSeq: Math.floor(upToSeq) });
     }
     return out;

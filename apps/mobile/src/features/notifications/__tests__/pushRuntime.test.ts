@@ -45,7 +45,10 @@ const mockSetPushAvailable = jest.fn();
 const mockNoteInboundDelivered = jest.fn();
 const mockInitPush = jest.fn(async () => undefined);
 const mockSetNativeMute = jest.fn();
-const mockRefreshSession = jest.fn(async () => ({ status: 'ok', access: 'fresh' }));
+const mockRefreshSession = jest.fn(async () => ({
+  status: 'ok',
+  access: 'fresh',
+}));
 const mockSetConversationMute = jest.fn((..._a: unknown[]) =>
   Promise.resolve(undefined),
 );

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The activity's window background for the whole pre-home phase (§L2).
+
+  This is load-bearing, not decoration. AppTheme previously declared no
+  android:windowBackground, so it fell through to AppCompat's default
+  (#FAFAFA in day mode, #303030 at night) and that colour was painted in the
+  gap between the API 31+ system splash being dismissed and React Native
+  drawing its first frame — a near-white flash between the black system splash
+  and the black JS splash. On API 24-30, where there is no system splash at
+  all, this drawable is the first thing the user sees.
+
+  So it repaints exactly what the system splash shows: the mark's own field
+  plus the same mark, centred in the same 288dp frame the platform uses for a
+  splash icon without an icon background. The mark therefore neither moves nor
+  changes size as ownership passes system splash -> window -> JS <Splash />.
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/ic_launcher_background" />
+    <item
+        android:width="288dp"
+        android:height="288dp"
+        android:gravity="center"
+        android:drawable="@mipmap/ic_launcher_foreground" />
+</layer-list>

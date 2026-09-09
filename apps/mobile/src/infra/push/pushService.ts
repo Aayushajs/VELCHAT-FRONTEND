@@ -585,9 +585,7 @@ export function disposePush(): void {
  * acknowledge delivery.
  */
 export type PushBlocker =
-  | 'notifications-off'
-  | 'battery-restricted'
-  | 'unsupported';
+  'notifications-off' | 'battery-restricted' | 'unsupported';
 
 export async function getPushBlocker(): Promise<PushBlocker | null> {
   if (status.phase === 'unsupported') return 'unsupported';

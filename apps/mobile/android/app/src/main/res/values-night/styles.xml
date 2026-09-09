@@ -8,8 +8,12 @@
         <!-- System navigation bar = the app's bottom tab surface (dark). -->
         <item name="android:navigationBarColor">#1A1A1C</item>
         <item name="android:windowLightNavigationBar">false</item>
-        <!-- Same pure-black brand field as the supplied launcher mark. -->
-        <item name="android:windowSplashScreenBackground">#000000</item>
+        <!-- Must be declared: left out, this inherits AppCompat's dark #303030 and
+             that grey gets painted in the gap before React Native's first frame. -->
+        <item name="android:windowBackground">@drawable/splash_screen</item>
+        <!-- The supplied mark's own field, shared with the launcher icon so the two
+             can never drift apart. -->
+        <item name="android:windowSplashScreenBackground">@color/ic_launcher_background</item>
         <item name="android:windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_foreground</item>
     </style>
 

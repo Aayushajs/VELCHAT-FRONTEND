@@ -96,8 +96,14 @@ export async function presenceOffline(
  * a phone, where a timer can be throttled or the radio can be asleep. Without this the account
  * stayed offline for the rest of the session with the app wide open.
  */
-export async function presenceHeartbeat(userId: string, deviceId?: string): Promise<void> {
-  await api.post('/presence/heartbeat', deviceId ? { userId, deviceId } : { userId });
+export async function presenceHeartbeat(
+  userId: string,
+  deviceId?: string,
+): Promise<void> {
+  await api.post(
+    '/presence/heartbeat',
+    deviceId ? { userId, deviceId } : { userId },
+  );
 }
 
 export { normalizePresenceEvent } from './presenceShape';

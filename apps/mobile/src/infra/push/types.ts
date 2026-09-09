@@ -28,12 +28,7 @@ export type PushPermission = 'granted' | 'denied' | 'unavailable';
  *   failed       we hold a token but the backend refused/was unreachable; retried on next init
  */
 export type PushPhase =
-  | 'idle'
-  | 'unsupported'
-  | 'denied'
-  | 'registering'
-  | 'registered'
-  | 'failed';
+  'idle' | 'unsupported' | 'denied' | 'registering' | 'registered' | 'failed';
 
 /** The whole push state, in one plain object. Pure — see `pushState.ts`. */
 export interface PushStatus {

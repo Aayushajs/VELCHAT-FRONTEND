@@ -202,8 +202,7 @@ class SyncEngine {
    * otherwise sit in the chat list showing a raw UUID until the next cold start.
    */
   private displayNameResolver:
-    | ((accountId: string) => Promise<string | undefined>)
-    | null = null;
+    ((accountId: string) => Promise<string | undefined>) | null = null;
   /** Account ids we already tried to name — one attempt each, never a retry loop per message. */
   private readonly namedPeers = new Set<string>();
   // Ephemeral realtime (§C4/§A15) — NEVER persisted. One owned expiry timer per typing
@@ -1129,7 +1128,9 @@ class SyncEngine {
           break;
         }
         if (opts.ignoreLifecycle) {
-          log.info('outbox walk claimed a row', { clientMsgId: item.clientMsgId });
+          log.info('outbox walk claimed a row', {
+            clientMsgId: item.clientMsgId,
+          });
         }
         try {
           const ack = await sendChatMessage(item.input);
@@ -1308,16 +1309,16 @@ class SyncEngine {
       typeof d.conversationId === 'string'
         ? d.conversationId
         : typeof d.conversation_id === 'string'
-        ? d.conversation_id
-        : undefined;
+          ? d.conversation_id
+          : undefined;
     const userId =
       typeof d.userId === 'string'
         ? d.userId
         : typeof d.user_id === 'string'
-        ? d.user_id
-        : typeof d.account_id === 'string'
-        ? d.account_id
-        : undefined;
+          ? d.user_id
+          : typeof d.account_id === 'string'
+            ? d.account_id
+            : undefined;
     if (conversationId === undefined || userId === undefined) return;
     if (state === 'stop') {
       this.clearTyping(conversationId);
@@ -1471,7 +1472,7 @@ class SyncEngine {
       try {
         const members = await getConversationMembers(conversationId);
         const others = members.filter(m => m !== me);
-        peerId = others.length === 1 ? others[0] ?? null : null;
+        peerId = others.length === 1 ? (others[0] ?? null) : null;
       } catch (e) {
         log.warn('presence members resolve failed', { reason: String(e) });
         return null;

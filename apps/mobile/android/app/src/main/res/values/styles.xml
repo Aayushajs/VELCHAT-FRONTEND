@@ -4,6 +4,10 @@
     <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
         <!-- Customize your theme here. -->
         <item name="android:editTextBackground">@drawable/rn_edit_text_material</item>
+        <!-- Must be declared: left out, this inherits AppCompat's #FAFAFA and that
+             near-white gets painted in the gap before React Native's first frame.
+             On API 24-30 (no system splash) this drawable IS the splash. -->
+        <item name="android:windowBackground">@drawable/splash_screen</item>
         <!-- System navigation bar = the app's bottom tab surface (light). -->
         <item name="android:navigationBarColor">#FFFFFF</item>
         <item name="android:windowLightNavigationBar">true</item>

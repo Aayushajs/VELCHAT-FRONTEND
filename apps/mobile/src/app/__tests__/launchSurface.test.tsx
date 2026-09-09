@@ -17,11 +17,15 @@ import React from 'react';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { render, screen } from '@testing-library/react-native';
-import { Splash, BRAND_FIELD, SPLASH_MARK_BOX, SPLASH_ICON_FRAME } from '../Splash';
+import {
+  Splash,
+  BRAND_FIELD,
+  SPLASH_MARK_BOX,
+  SPLASH_ICON_FRAME,
+} from '../Splash';
 
 const RES = path.resolve(__dirname, '../../../android/app/src/main/res');
-const read = (rel: string): string =>
-  readFileSync(path.join(RES, rel), 'utf8');
+const read = (rel: string): string => readFileSync(path.join(RES, rel), 'utf8');
 
 // Every theme variant that can be the resolved AppTheme on a supported device:
 // values/ = API 24-30 day, values-night/ = night, values-v31/ = API 31+ day.
@@ -63,9 +67,8 @@ test('the splash drawable paints the brand field and centres the same mark the s
 test('the system splash field is the shared colour resource, not a hex that can drift', () => {
   for (const file of THEMES) {
     const xml = read(file);
-    const declared = /<item name="android:windowSplashScreenBackground">([^<]+)</.exec(
-      xml,
-    );
+    const declared =
+      /<item name="android:windowSplashScreenBackground">([^<]+)</.exec(xml);
     // Only API 31+ variants carry the attribute at all; where present it must
     // be the shared resource.
     if (declared) {

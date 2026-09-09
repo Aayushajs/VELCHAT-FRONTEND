@@ -193,7 +193,8 @@ function startNameMirror(): void {
         // The same row already carries the peer photo the chat list draws, so mirroring it costs
         // one more map and no extra query. Native caches it to a file from here — the push path
         // cannot fetch anything.
-        if (row.peerId && row.peerAvatarUrl) faces[row.peerId] = row.peerAvatarUrl;
+        if (row.peerId && row.peerAvatarUrl)
+          faces[row.peerId] = row.peerAvatarUrl;
       }
       // Our OWN photo, under our own account id.
       //
