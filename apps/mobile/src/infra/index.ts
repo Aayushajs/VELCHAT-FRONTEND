@@ -190,6 +190,7 @@ export {
   subscribePushMessages,
   subscribePushEvents,
   drainPendingEvents,
+  takeQueuedPushEvents,
   syncConversationNames,
   syncPersonNames,
   syncPersonAvatars,

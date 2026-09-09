@@ -63,10 +63,18 @@ jest.mock('../../../infra', () => ({
   subscribeSession: () => () => undefined,
   drainPendingEvents: async () => {
     // Mirrors the real contract: the queue is emptied by the read, and every listener in this
-    // context receives the batch.
+    // context receives the batch. Still the app's path — a live context applies actions as they
+    // arrive rather than waiting for them.
     const batch = mockState.queued;
     mockState.queued = [];
     for (const event of batch) for (const l of mockListeners) l(event);
+  },
+  takeQueuedPushEvents: async () => {
+    // The HEADLESS path takes the batch instead of pushing it through listeners, so the wake can
+    // await each action and only resolve once the work is genuinely done. Same emptying contract.
+    const batch = mockState.queued;
+    mockState.queued = [];
+    return batch;
   },
   initPush: () => mockInitPush(),
   unregisterPush: async () => undefined,

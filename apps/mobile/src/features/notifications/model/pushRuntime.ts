@@ -23,7 +23,7 @@
  */
 import { log } from '../../../core';
 import {
-  drainPendingEvents,
+  takeQueuedPushEvents,
   getAccountId,
   initPush,
   setNativeMute,
@@ -273,7 +273,17 @@ async function handlePushEvent(event: PushPendingEvent): Promise<void> {
  * `SyncEngine.flushOutboxNow`.
  */
 export async function runQueuedPushActions(): Promise<void> {
-  installEventHandler();
+  // Deliberately NOT `installEventHandler` + `drainPendingEvents`.
+  //
+  // That route applied each event through a subscription and then awaited a snapshot of whatever
+  // promises the listener had started by then — so whether this task waited for the reply at all
+  // came down to timing. On a device it declared the handlers done 38 ms after the drain, which is
+  // not long enough for the two SQLite writes a reply performs, and the send then completed 600 ms
+  // AFTER the task ended and the service stopped. It arrived only because the process happened not
+  // to be reaped yet; on the user's phone it was, and the reply left when the app was next opened.
+  //
+  // Taking the events and awaiting each one removes the timing from the picture: when this
+  // function resolves, the work is genuinely finished.
   // BEFORE anything is sent. A woken process gets one bounded window, and an access token that
   // has already expired turns the reply into 401 -> refresh -> retry inside it. On a phone on
   // mobile data that chain does not always finish: the failure classifies as transient, which
@@ -281,10 +291,29 @@ export async function runQueuedPushActions(): Promise<void> {
   // which is exactly what a reply button is supposed to save them from. Refreshing first spends
   // one round trip instead of three.
   await refreshIfExpiring();
-  await drainPendingEvents();
-  // `allSettled`: one failed handler must not abandon the others, and each already logs itself.
-  await Promise.allSettled([...inflight]);
+  const events = await takeQueuedPushEvents();
+  if (events.length > 0) {
+    log.info('push: applying queued notification actions', {
+      count: events.length,
+    });
+  }
+  // Sequentially, and each one awaited. `allSettled` over the results rather than a bare loop so
+  // one failing action cannot abandon the rest — a reply must still go out if a mute failed.
+  const outcomes = await Promise.allSettled(
+    events.map(event => () => handlePushEvent(event)).map(run => run()),
+  );
+  for (let i = 0; i < outcomes.length; i++) {
+    const outcome = outcomes[i];
+    if (outcome?.status === 'rejected') {
+      log.warn('push action failed', {
+        type: events[i]?.type,
+        reason: String(outcome.reason),
+      });
+    }
+  }
+  log.info('push: handlers done, flushing the outbox');
   await syncEngine.flushOutboxNow();
+  log.info('push: outbox flushed');
 
   // One more pass, if anything is still queued.
   //
@@ -303,6 +332,15 @@ export async function runQueuedPushActions(): Promise<void> {
   } catch (err) {
     log.info('push: could not re-check the outbox', { reason: String(err) });
   }
+
+  // The task's last act, so a device log can say WHERE it ended.
+  //
+  // Without this, a capture showed the task starting, the database being touched, and then
+  // silence — and the foreground service stopping 187 ms later was consistent with two completely
+  // different stories: the task finishing early, or the OS pulling the service out from under a
+  // task that was still working. Those need opposite fixes, and nothing in the log chose between
+  // them. It does now.
+  log.info('push: queued actions complete');
 }
 
 /**

@@ -47,6 +47,19 @@ internal class PushHeadlessService : HeadlessJsTaskService() {
    * system kills the process, so it happens here, before anything else.
    */
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    // A partial wakelock for the life of the task, held by React Native and released when the
+    // task finishes.
+    //
+    // Being a foreground service is not enough on its own. Measured on a ColorOS device: the
+    // service went foreground with the `shortService` type and was stopped 187 ms later, while
+    // the reply's HTTP send was still in flight — it completed 600 ms after that only because the
+    // process had not been reaped yet. That is luck, not a design. The wakelock keeps the CPU
+    // awake for the work regardless of what happens to the service's foreground status, which is
+    // the difference between "usually sends" and "sends".
+    //
+    // Bounded by the same TIMEOUT_MS as the task, and released by RN when the task ends, so §M13's
+    // no-leaked-wakelock rule holds.
+    HeadlessJsTaskService.acquireWakeLockNow(this)
     try {
       val notification = PushNotifications.workingNotification(this)
       if (Build.VERSION.SDK_INT >= 34) {

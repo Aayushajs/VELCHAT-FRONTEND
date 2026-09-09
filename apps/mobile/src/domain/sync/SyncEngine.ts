@@ -1100,15 +1100,37 @@ class SyncEngine {
       // Never claim before crash-recovery has un-stuck orphaned `sending` rows.
       if (this.recovery) await this.recovery;
       for (;;) {
+        // Why a walk STOPPED, on the one path where a stop is a bug.
+        //
+        // A wake window has no second chance, and every exit below looks identical from outside:
+        // the walk returns, the task completes, the process dies, and the message leaves when the
+        // app is next opened. The device log said only "flushed" — true, and useless. It now says
+        // which of these it was. Only for `ignoreLifecycle`, i.e. the headless flush, so the app's
+        // ordinary drains stay silent.
+        const stop = (reason: string): void => {
+          if (opts.ignoreLifecycle) log.info('outbox walk stopped', { reason });
+        };
         // `hasSession()` is checked either way: without tokens there is nothing to send, and no
         // caller may bypass that.
-        if (!hasSession()) break;
+        if (!hasSession()) {
+          stop('no session');
+          break;
+        }
         if (!opts.ignoreLifecycle && (this.stopped || !this.online)) break;
         // Rate limited a moment ago — walking the queue now just re-earns the 429 and burns an
         // attempt on every message behind it.
-        if (Date.now() < this.outboxCooldownUntil) break;
+        if (Date.now() < this.outboxCooldownUntil) {
+          stop('cooldown');
+          break;
+        }
         const item = await claimNextDue(Date.now());
-        if (!item) break;
+        if (!item) {
+          stop('nothing claimable');
+          break;
+        }
+        if (opts.ignoreLifecycle) {
+          log.info('outbox walk claimed a row', { clientMsgId: item.clientMsgId });
+        }
         try {
           const ack = await sendChatMessage(item.input);
           await markMessageSent(item.clientMsgId, ack);
