@@ -10,7 +10,7 @@ import {
   hasNotificationPermission,
   hasDeviceKey,
   signChallenge,
-  hasSession,
+  hasValidSession,
   getRefreshToken,
   refreshAccessToken,
   getDeviceId,
@@ -266,7 +266,11 @@ export function useAuthBootstrap(): boolean {
   const hydrate = useAuthStore(s => s.hydrate);
 
   useEffect(() => {
-    if (hasSession()) {
+    // `hasValidSession()`, not merely "a token exists" (VC-036): an access token that is present
+    // but EXPIRED must fall through to the refresh branch below, not hydrate straight away — that
+    // used to hand SyncEngine a token the server was certain to reject, costing a guaranteed
+    // failed handshake + refresh + reconnect on every cold start after 15 minutes idle.
+    if (hasValidSession()) {
       hydrate();
       setReady(true);
       return undefined;

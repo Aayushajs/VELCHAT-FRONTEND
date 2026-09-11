@@ -663,7 +663,7 @@
       "title": "Concurrent applyServerMessages duplicates every row in the overlap, and can lose a whole batch on a conversation PK clash",
       "severity": "P0",
       "priority": "P0",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Offline sync / Local DB",
       "component": "apps/mobile/src/infra/db/messages.ts:202-234",
@@ -690,15 +690,16 @@
         "apps/mobile/src/domain/sync/SyncEngine.ts:192-198,677,751,963"
       ],
       "regression": false,
-      "notes": "VC-001 makes this far more likely to be hit in practice, because seq gaps are constant.",
-      "jira": "VC-9"
+      "notes": "VC-001 makes this far more likely to be hit in practice, because seq gaps are constant. FIX: The three lookup queries in applyServerMessages moved inside db.write(), read before any prepareCreate/prepareUpdate call — closes the race without violating the prepare-then-batch-synchronously constraint. Verified: full jest suite 454/454 pass, tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-9",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-021",
       "title": "applyReceipt is a non-atomic read-modify-write, so blue ticks can regress to grey",
       "severity": "P0",
       "priority": "P0",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Receipts",
       "component": "apps/mobile/src/infra/db/messages.ts:480-491",
@@ -721,8 +722,9 @@
       "evidence": ["QA/_audit/sync-db-audit.md"],
       "refs": ["apps/mobile/src/infra/db/messages.ts:480-491"],
       "regression": false,
-      "notes": "Every existing receipt test applies receipts sequentially, which is exactly why they all pass.",
-      "jira": "VC-10"
+      "notes": "Every existing receipt test applies receipts sequentially, which is exactly why they all pass. FIX: applyReceipt now re-fetches the rows to update from inside db.write() (same pattern as VC-020) instead of before it, so the monotonic check is atomic with the write. Verified: full jest suite 454/454 pass, tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-10",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-022",
@@ -867,7 +869,7 @@
       "title": "Unread count climbs and the read watermark stalls for messages backfilled into the chat you are reading",
       "severity": "P1",
       "priority": "P1",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Messaging / Unread",
       "component": "apps/mobile/src/infra/db/messages.ts:301 + domain/sync/SyncEngine.ts:786-794",
@@ -894,8 +896,9 @@
         "apps/mobile/src/domain/sync/SyncEngine.ts:786-794"
       ],
       "regression": false,
-      "notes": "VC-001 makes backfills constant, so this fires often.",
-      "jira": "VC-26"
+      "notes": "VC-001 makes backfills constant, so this fires often. FIX: pageBackfill now mirrors the live-message path: if the backfilled page lands in the conversation on screen, it marks read (noteRead + clearUnread) instead of only noteDelivered. Verified: full jest suite 454/454 pass, tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-26",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-027",
@@ -1196,7 +1199,7 @@
       "title": "Cold start after >15 min idle opens the WebSocket with a certainly-expired token",
       "severity": "P2",
       "priority": "P2",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Authentication / Realtime",
       "component": "apps/mobile/src/features/auth/hooks/useAuth.ts:269-273",
@@ -1220,8 +1223,9 @@
       "evidence": ["QA/_audit/auth-network-push-audit.md#d13"],
       "refs": ["apps/mobile/src/infra/network/tokens.ts:83-85,98"],
       "regression": false,
-      "notes": "",
-      "jira": "VC-36"
+      "notes": "FIX: hasValidSession() added (tokens.ts); useAuthBootstrap now refreshes before hydrating on an expired-but-present token. hasSession() deliberately left presence-only to protect SyncEngine reconnect guards. Verified: full jest suite 454/454 pass, tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-36",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-037",

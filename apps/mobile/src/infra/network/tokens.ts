@@ -113,6 +113,25 @@ export function accessTokenExpiresInMs(now: number = Date.now()): number {
   }
 }
 
+/**
+ * True when a session both EXISTS and has a currently-valid (non-expired) access token (VC-036).
+ *
+ * Deliberately separate from `hasSession()`, which stays presence-only on purpose: SyncEngine's
+ * reconnect and 4001-recovery guards (`connect()`, `onClose()`, `recoverFromUnauthorized()`) must
+ * stay true for a token that is merely expired-but-present — that is exactly the case the
+ * socket's own 4001 → refresh → reconnect self-healing exists to repair. If `hasSession()` itself
+ * went expiry-aware, those guards would bail BEFORE the handshake that triggers that repair ever
+ * runs, trading one wasted cold-start handshake for realtime stuck disconnected until a
+ * force-quit — worse than the bug this fixes.
+ *
+ * This is for the one caller that genuinely needs "is this usable right now, with no round trip
+ * to find out": the cold-start bootstrap, which must refresh BEFORE opening a socket rather than
+ * let a doomed handshake fail once (`useAuthBootstrap` in `features/auth/hooks/useAuth.ts`).
+ */
+export function hasValidSession(): boolean {
+  return hasSession() && accessTokenExpiresInMs() > 0;
+}
+
 // ── session change notification ────────────────────────────────────────────────
 /**
  * Listeners for "a session appeared / went away".

@@ -13,7 +13,12 @@ import type { AxiosRequestConfig } from 'axios';
 
 import { kv, KVKeys } from '../../kv';
 import { api, refreshSession } from '../client';
-import { clearSession, hasSession, setTokens } from '../tokens';
+import {
+  clearSession,
+  hasSession,
+  hasValidSession,
+  setTokens,
+} from '../tokens';
 
 /** Mint a JWT whose `exp` is `offsetSec` from now. Unsigned — only the payload is read locally. */
 function jwtWithExp(offsetSec: number): string {
@@ -34,8 +39,8 @@ function jwtWithExp(offsetSec: number): string {
 
 /** Record every request the axios instance actually emits, and reply with a scripted response. */
 interface Captured {
-  url?: string;
-  method?: string;
+  url: string | undefined;
+  method: string | undefined;
   headers: Record<string, unknown>;
   data?: unknown;
 }
@@ -91,12 +96,16 @@ function installAdapter(
       throw err;
     }
     return response;
-  }) as typeof api.defaults.adapter;
+  }) as NonNullable<typeof api.defaults.adapter>;
 
   return {
     captured,
     restore: () => {
-      api.defaults.adapter = original;
+      if (original === undefined) {
+        delete api.defaults.adapter;
+      } else {
+        api.defaults.adapter = original;
+      }
     },
   };
 }
@@ -108,30 +117,46 @@ beforeEach(() => {
   kv.delete(KVKeys.cnfJkt);
 });
 
-describe('VC-036 — hasSession() must not report a session for an EXPIRED access token', () => {
-  it('returns false when the stored access token is already past its exp', () => {
+describe('VC-036 — the cold-start bootstrap must not treat an EXPIRED access token as usable', () => {
+  // `hasSession()` itself stays presence-only on purpose: SyncEngine.ts guards its reconnect
+  // and 4001-recovery paths with it (e.g. `recoverFromUnauthorized()`), and those must stay
+  // true for a token that is merely expired-but-present — that is exactly the case the socket's
+  // own 4001 -> refresh -> reconnect self-healing exists to repair. Making `hasSession()` itself
+  // expiry-aware would make `connect()`/`onClose()` bail before ever attempting the handshake
+  // that triggers that repair, trading a wasted cold-start handshake for realtime stuck
+  // disconnected until a force-quit — worse than the bug being fixed. So the fix lives in a
+  // narrower function used ONLY by the one caller that must know "is this usable RIGHT NOW":
+  // the bootstrap, which must refresh BEFORE opening a socket (useAuth.ts's `useAuthBootstrap`).
+  it('hasValidSession() returns false when the stored access token is already past its exp', () => {
     setTokens({
       accountId: 'acct-1',
       deviceId: 'dev-1',
       access: jwtWithExp(-60), // expired a minute ago
       refresh: 'opaque-refresh-token',
-      expiresIn: 900,
     });
-
-    // Why this matters: useAuth.ts:269-273 branches on hasSession() and, when true, hydrates
-    // WITHOUT refreshing. SyncEngine then opens the WebSocket with a token the server will reject
-    // (close 4001), costing a guaranteed failed handshake + refresh + reconnect on every cold
-    // start after 15 minutes idle. `accessTokenExpiresInMs()` already exists for exactly this.
-    expect(hasSession()).toBe(false);
+    expect(hasValidSession()).toBe(false);
   });
 
-  it('returns true for a token that is still valid', () => {
+  it('hasValidSession() returns true for a token that is still valid', () => {
     setTokens({
       accountId: 'acct-1',
       deviceId: 'dev-1',
       access: jwtWithExp(600),
       refresh: 'opaque-refresh-token',
-      expiresIn: 900,
+    });
+    expect(hasValidSession()).toBe(true);
+  });
+
+  it('hasValidSession() returns false when there is no session at all', () => {
+    expect(hasValidSession()).toBe(false);
+  });
+
+  it("hasSession() stays presence-only — an expired token still counts, for SyncEngine's reconnect guards", () => {
+    setTokens({
+      accountId: 'acct-1',
+      deviceId: 'dev-1',
+      access: jwtWithExp(-60),
+      refresh: 'opaque-refresh-token',
     });
     expect(hasSession()).toBe(true);
   });
@@ -144,7 +169,6 @@ describe('VC-015 — the refresh request must carry a real cnfJkt device binding
       deviceId: 'dev-1',
       access: jwtWithExp(600),
       refresh: 'opaque-refresh-token',
-      expiresIn: 900,
     });
 
     const sent: unknown[] = [];
@@ -162,7 +186,6 @@ describe('VC-015 — the refresh request must carry a real cnfJkt device binding
             deviceId: 'dev-1',
             access: jwtWithExp(900),
             refresh: 'next-refresh',
-            expiresIn: 900,
           },
         },
       };
@@ -194,7 +217,6 @@ describe('VC-034 — a 429 Retry-After must be clamped, not obeyed unbounded', (
       deviceId: 'd',
       access: jwtWithExp(600),
       refresh: 'r',
-      expiresIn: 900,
     });
 
     // A legal, trivially injectable header. `await wait(retryAfter * 1000)` with no ceiling parks
@@ -241,7 +263,6 @@ describe('VC-010 — sign-out calls must still carry the Authorization header', 
       deviceId: 'dev-1',
       access: jwtWithExp(600),
       refresh: 'opaque-refresh-token',
-      expiresIn: 900,
     });
 
     const { captured, restore } = installAdapter(() => ({ status: 200 }));
@@ -260,8 +281,8 @@ describe('VC-010 — sign-out calls must still carry the Authorization header', 
     }
 
     expect(captured).toHaveLength(1);
-    const auth =
-      captured[0].headers.Authorization ?? captured[0].headers.authorization;
+    const first = captured[0];
+    const auth = first?.headers.Authorization ?? first?.headers.authorization;
     expect(String(auth ?? '')).toMatch(/^Bearer \S+/);
   });
 });

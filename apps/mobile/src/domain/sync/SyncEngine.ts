@@ -792,6 +792,18 @@ class SyncEngine {
           inbound.reduce((max, m) => (m.seq > max ? m.seq : max), 0),
         );
       }
+      // A page landing in the conversation ON SCREEN has been seen, exactly like the live path
+      // above (VC-026) — otherwise a reconnect backfill into an open chat climbs the unread badge
+      // on the conversation the user is actively reading, and the peer's ticks stall on grey until
+      // the user leaves and re-enters.
+      if (this.activeConversationId === conversationId) {
+        this.noteRead(conversationId, highest);
+        try {
+          await clearUnread(conversationId);
+        } catch {
+          // badge cosmetics only — never fail the backfill over it
+        }
+      }
       if (highest <= cursor) return; // server isn't advancing — stop rather than spin
       cursor = highest;
       if (batch.length < BACKFILL_PAGE) return; // short page = caught up

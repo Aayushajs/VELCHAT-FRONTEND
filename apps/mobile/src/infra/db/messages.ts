@@ -189,49 +189,55 @@ export async function applyServerMessages(
   const convs = db.get<Conversation>('conversations');
   const now = Date.now();
   const sorted = [...servers].sort((a, b) => a.seq - b.seq);
-  // Look the whole batch up in TWO queries instead of two per row. The per-row version ran 2N
-  // serialised SQLite reads INSIDE the write transaction, holding the writer lock the entire
-  // time — so a 100-row backfill blocked every other write behind it, including the optimistic
-  // send, and the composer visibly froze the moment a catch-up landed.
+  // Look the whole batch up in TWO queries instead of two per row (still true — see below), but
+  // read them from INSIDE the write lock, not before it (VC-020). WatermelonDB serialises
+  // `db.write` calls against each other, so a read taken before acquiring the lock can be stale
+  // by the time this call's turn comes: two calls for the same conversation (e.g. a reconnect's
+  // resyncAll page racing a gap-probe's backfillConversation) could each see "nothing exists yet"
+  // and both decide to insert the same logical message, or both try to create the same new-DM
+  // stub and have the loser's batch rejected outright. Reading here, after the lock is held and
+  // before any `prepareX` call, is what makes "check" and "act" atomic — and it stays compatible
+  // with the batch()-must-follow-prepare-synchronously constraint below, because these reads
+  // finish BEFORE the first `prepareCreate`/`prepareUpdate`, not between one and `batch()`.
   const clientIds = sorted
     .map(s => s.clientMsgId)
     .filter((id): id is string => typeof id === 'string' && id.length > 0);
   const seqs = sorted.map(s => s.seq);
   const convIds = [...new Set(sorted.map(s => s.conversationId))];
 
-  const [existingByClient, existingBySeq, existingConvs] = await Promise.all([
-    clientIds.length > 0
-      ? msgs.query(Q.where('client_msg_id', Q.oneOf(clientIds))).fetch()
-      : Promise.resolve([] as Message[]),
-    msgs
-      .query(
-        Q.where('conversation_id', Q.oneOf(convIds)),
-        Q.where('seq', Q.oneOf(seqs)),
-      )
-      .fetch(),
-    // Resolved UP FRONT, outside the write. WatermelonDB requires every prepared operation to
-    // reach `batch()` synchronously; awaiting a conversation lookup after the message rows were
-    // already prepared breaks that invariant ("wasn't sent to batch() synchronously — this is
-    // bad!") and can drop those prepared writes, which is an inbound message that silently never
-    // persists. One query for the batch also replaces a find() per conversation.
-    convs.query(Q.where('id', Q.oneOf(convIds))).fetch(),
-  ]);
-  const convById = new Map<string, Conversation>();
-  for (const c of existingConvs) convById.set(c.id, c);
-
-  const byClientId = new Map<string, Message>();
-  for (const row of existingByClient) {
-    if (row.clientMsgId) byClientId.set(row.clientMsgId, row);
-  }
-  const bySeqKey = new Map<string, Message[]>();
-  for (const row of existingBySeq) {
-    const key = `${row.conversationId}#${String(row.seq)}`;
-    const list = bySeqKey.get(key);
-    if (list) list.push(row);
-    else bySeqKey.set(key, [row]);
-  }
-
   await db.write(async () => {
+    const [existingByClient, existingBySeq, existingConvs] = await Promise.all([
+      clientIds.length > 0
+        ? msgs.query(Q.where('client_msg_id', Q.oneOf(clientIds))).fetch()
+        : Promise.resolve([] as Message[]),
+      msgs
+        .query(
+          Q.where('conversation_id', Q.oneOf(convIds)),
+          Q.where('seq', Q.oneOf(seqs)),
+        )
+        .fetch(),
+      // WatermelonDB requires every prepared operation to reach `batch()` synchronously; an
+      // await AFTER the first `prepareX` call breaks that invariant ("wasn't sent to batch()
+      // synchronously — this is bad!") and can drop the prepared writes. This lookup — like the
+      // two above — finishes before any `prepareX` runs, so it never violates that rule. One
+      // query for the batch also replaces a find() per conversation.
+      convs.query(Q.where('id', Q.oneOf(convIds))).fetch(),
+    ]);
+    const convById = new Map<string, Conversation>();
+    for (const c of existingConvs) convById.set(c.id, c);
+
+    const byClientId = new Map<string, Message>();
+    for (const row of existingByClient) {
+      if (row.clientMsgId) byClientId.set(row.clientMsgId, row);
+    }
+    const bySeqKey = new Map<string, Message[]>();
+    for (const row of existingBySeq) {
+      const key = `${row.conversationId}#${String(row.seq)}`;
+      const list = bySeqKey.get(key);
+      if (list) list.push(row);
+      else bySeqKey.set(key, [row]);
+    }
+
     const ops: Model[] = [];
     const bumps = new Map<string, ConvBump>();
     for (const s of sorted) {
@@ -477,18 +483,25 @@ export async function applyReceipt(
   // a long DM) just to find the one or two rows that actually needed updating.
   const behind = Object.keys(rank).filter(k => (rank[k] ?? 0) < target);
   if (behind.length === 0) return;
-  const toUpdate = await db
-    .get<Message>('messages')
-    .query(
-      Q.where('conversation_id', conversationId),
-      Q.where('sender_id', meId),
-      Q.where('seq', Q.gt(0)),
-      Q.where('seq', Q.lte(upToSeq)),
-      Q.where('state', Q.oneOf(behind)),
-    )
-    .fetch();
-  if (toUpdate.length === 0) return;
   await db.write(async () => {
+    // Read the CURRENT state from inside the write lock, not before it (VC-021): WatermelonDB
+    // serialises `db.write` calls against each other, so by the time this callback runs, any
+    // concurrent `applyReceipt` for the same message has already fully landed. Fetching here
+    // (rather than passing in rows read before either call acquired the lock) is what makes the
+    // monotonic check atomic with the update — two receipts racing for the same watermark can no
+    // longer both read "still behind", agree, and let write order — not receipt order — decide
+    // which state wins.
+    const toUpdate = await db
+      .get<Message>('messages')
+      .query(
+        Q.where('conversation_id', conversationId),
+        Q.where('sender_id', meId),
+        Q.where('seq', Q.gt(0)),
+        Q.where('seq', Q.lte(upToSeq)),
+        Q.where('state', Q.oneOf(behind)),
+      )
+      .fetch();
+    if (toUpdate.length === 0) return;
     await db.batch(
       ...toUpdate.map(r =>
         r.prepareUpdate(m => {

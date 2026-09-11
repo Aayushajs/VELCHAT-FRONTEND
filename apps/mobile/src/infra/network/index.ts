@@ -55,6 +55,7 @@ export {
   getAccountId,
   getPhone,
   hasSession,
+  hasValidSession,
   accessTokenExpiresInMs,
   setTokens,
   clearSession,
