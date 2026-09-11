@@ -1,0 +1,18 @@
+{
+  "name": "@velchat/qa",
+  "private": true,
+  "type": "module",
+  "description": "VelChat QA automation: API + WebSocket integration tests, evidence capture, Excel/Jira reporting. Zero runtime dependencies — Node 22 built-ins only (fetch, WebSocket, node:test).",
+  "scripts": {
+    "qa:env": "node scripts/check-env.mjs",
+    "qa:api": "node --test tests/api/*.test.js",
+    "qa:websocket": "node --test --test-concurrency=1 tests/websocket/*.test.js",
+    "qa:client": "cd ../apps/mobile && npx jest --config jest.qa.config.js",
+    "qa": "npm run qa:env && npm run qa:api && npm run qa:websocket",
+    "qa:report": "python scripts/build_excel_report.py",
+    "qa:jira:dry": "node scripts/jira/sync.mjs --dry-run",
+    "qa:jira": "node scripts/jira/sync.mjs",
+    "qa:sync": "python scripts/build_excel_report.py && node scripts/sync/push-pull.mjs",
+    "qa:sync:watch": "node scripts/sync/watch.mjs"
+  }
+}

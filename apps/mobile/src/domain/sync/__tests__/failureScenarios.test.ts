@@ -1110,3 +1110,146 @@ describe('loading older history', () => {
     expect(seqs).toEqual([...seqs].sort((x, y) => x - y));
   });
 });
+
+// ── 10. concurrent applyServerMessages on the same conversation (VC-020) ─────
+//
+// `applyServerMessages` reads `existingByClient`/`existingBySeq`/`existingConvs` OUTSIDE
+// `db.write` (a deliberate perf fix — seeing the comment above that Promise.all in messages.ts).
+// WatermelonDB serializes `db.write` calls against each other, but NOT the reads before them, so
+// two legitimately different callers for the SAME conversation — `resyncAll`'s page walk and an
+// inbound gap-probe's `backfillConversation`, say — can each read "nothing exists yet" and both
+// decide to INSERT the same logical message.
+
+describe('overlapping applyServerMessages for one conversation', () => {
+  const conv = 'race_batch_conv';
+
+  beforeEach(async () => {
+    await upsertConversation(conv, { type: 'dm', name: 'Peer' });
+  });
+
+  it('does not duplicate a batch when two callers race to apply the same window', async () => {
+    const batch = [serverMsg(conv, 1), serverMsg(conv, 2), serverMsg(conv, 3)];
+
+    await Promise.all([applyServerMessages(batch), applyServerMessages(batch)]);
+
+    const rows = await rowsBySeq(conv);
+    expect(rows.map(r => r.seq)).toEqual([1, 2, 3]);
+  });
+
+  it('does not drop the second caller’s extra messages when both also race to create the same new-conversation stub', async () => {
+    const stub = 'race_stub_conv';
+    // Neither caller holds this conversation locally yet, so both also try to create the SAME
+    // stub row (a brand-new DM). `pageA` is resyncAll's page; `pageB` is a gap-probe that fetched
+    // a touch later and saw two more messages that had landed in the meantime.
+    const pageA = [serverMsg(stub, 1), serverMsg(stub, 2), serverMsg(stub, 3)];
+    const pageB = [
+      serverMsg(stub, 1),
+      serverMsg(stub, 2),
+      serverMsg(stub, 3),
+      serverMsg(stub, 4),
+      serverMsg(stub, 5),
+    ];
+
+    const results = await Promise.allSettled([
+      applyServerMessages(pageA),
+      applyServerMessages(pageB),
+    ]);
+    for (const r of results) {
+      if (r.status === 'rejected') throw r.reason;
+    }
+
+    const rows = await rowsBySeq(stub);
+    expect(rows.map(r => r.seq)).toEqual([1, 2, 3, 4, 5]);
+    expect((await conversationRow(stub)).unreadCount).toBe(5);
+  });
+});
+
+// ── 11. concurrent receipts for the same message must never regress (VC-021) ─
+//
+// Monotonicity ("only move a message to a HIGHER state") is enforced only in the query
+// predicate of `applyReceipt`, which is evaluated in a `.fetch()` OUTSIDE `db.write`. Two
+// independent, un-awaited receipt frames — a live `read` and a late/reconciled `delivered` for
+// the same watermark — can each read the row's stale pre-write state and race to write.
+
+describe('concurrent receipts for the same message', () => {
+  const conv = 'concurrent_receipt_conv';
+
+  beforeEach(async () => {
+    await upsertConversation(conv, { type: 'dm', name: 'Peer' });
+  });
+
+  it('leaves the row at read, never regressed to delivered, when both arrive together', async () => {
+    serverHistory.set(
+      conv,
+      [1, 2, 3, 4].map(seq => serverMsg(conv, seq, { senderId: ME })),
+    );
+    const socket = await bootConnected();
+    await until(
+      async () => (await messagesOf(conv)).length === 4,
+      'our four messages to exist locally',
+    );
+
+    // Fired back to back, un-awaited: `onInboundReceipt` awaits `peerIdFor` before it ever
+    // reaches `applyReceipt`, so both handlers' read phases are in flight at once.
+    socket.cb.onReceipt?.({ conversationId: conv, upToSeq: 4, state: 'read' });
+    socket.cb.onReceipt?.({
+      conversationId: conv,
+      upToSeq: 4,
+      state: 'delivered',
+    });
+
+    await until(
+      async () => (await rowsBySeq(conv)).every(r => r.state !== 'sent'),
+      'both receipts to be applied',
+    );
+    await settle();
+
+    expect((await rowsBySeq(conv)).map(r => r.state)).toEqual([
+      'read',
+      'read',
+      'read',
+      'read',
+    ]);
+  });
+});
+
+// ── 12. a reconnect backfill into the OPEN conversation (VC-026) ─────────────
+//
+// The live-message path treats a message landing in the conversation on screen as read at once
+// (§ "unread badge" above). A reconnect's catch-up backfill for that same conversation must do
+// the same — otherwise the badge climbs, and the peer never learns we've read it, until the user
+// leaves and re-enters the chat.
+
+describe('backfill into the conversation on screen', () => {
+  const conv = 'active_backfill_conv';
+
+  beforeEach(async () => {
+    await upsertConversation(conv, { type: 'dm', name: 'Peer' });
+  });
+
+  it('does not stall unread/read state when the reconnect backfill lands in the open chat', async () => {
+    syncEngine.setActiveConversation(conv);
+    serverHistory.set(
+      conv,
+      [1, 2, 3].map(seq => serverMsg(conv, seq)),
+    );
+
+    const socket = await bootConnected();
+
+    await until(
+      async () => (await messagesOf(conv)).length === 3,
+      'the backfill to land',
+    );
+    await settle();
+
+    expect((await conversationRow(conv)).unreadCount).toBe(0);
+    await until(
+      () => socket.sent.some(f => f.type === 'read'),
+      'the read receipt for the backfilled messages',
+    );
+    expect(socket.sent.find(f => f.type === 'read')?.data).toEqual({
+      conversationId: conv,
+      seq: 3,
+    });
+  });
+});

@@ -54,3 +54,18 @@ metro-cache/
 # Built APKs. Release artefacts, not source — and a 31MB binary per build would make every
 # clone carry the history of every test build.
 apk-out/
+
+# QA local config — holds Jira/BrowserStack/Google credentials. NEVER commit.
+QA/config/qa.env
+QA/config/*.json
+QA/reports/results.jsonl
+QA/evidence/**
+!QA/evidence/**/.gitkeep
+
+# QA sync bookkeeping (§ Excel/Sheets two-way sync) — pure local state, regenerated on every run,
+# meaningless without the local machine's edit history. bugs.json and the .xlsx ARE committed
+# (they're the actual QA registry/report); only the internal "who wrote this last" ledgers aren't.
+QA/reports/.excel_state.json
+QA/reports/.sheets_state.json
+QA/reports/.sync_bridge.json
+QA/reports/~$*
