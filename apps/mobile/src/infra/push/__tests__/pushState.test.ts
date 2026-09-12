@@ -10,6 +10,7 @@ import {
   isPushAvailable,
   registrationKey,
   shouldRegister,
+  notificationsGranted,
 } from '../pushState';
 import type { PushEvent, PushStatus } from '../types';
 
@@ -278,5 +279,28 @@ describe('failure diagnostics never carry the token', () => {
     );
     expect(s.error).toBe('http 401');
     expect(s.error).not.toContain('super-secret-token');
+  });
+});
+
+describe('notificationsGranted (VC-012)', () => {
+  // On Android <33 there is no runtime permission dialog, so `permitted` (the raw dialog
+  // answer) is unconditionally true — it says nothing about whether the user switched the
+  // app's notifications off in system Settings, or the message channel is blocked. Only the
+  // native `areNotificationsEnabled`-backed check (`blocked`) can see that on every API level,
+  // and the two questions must BOTH clear before `isPushAvailable` may drop the socket.
+  it('requires the permission AND the OS not blocking the channel/app', () => {
+    expect(notificationsGranted(true, false)).toBe(true);
+  });
+
+  it('the exact defect: permitted=true (pre-33 hardcode) but the OS is blocking it', () => {
+    expect(notificationsGranted(true, true)).toBe(false);
+  });
+
+  it('denied permission is never granted, even if somehow not reported blocked', () => {
+    expect(notificationsGranted(false, false)).toBe(false);
+  });
+
+  it('both against us stays denied', () => {
+    expect(notificationsGranted(false, true)).toBe(false);
   });
 });

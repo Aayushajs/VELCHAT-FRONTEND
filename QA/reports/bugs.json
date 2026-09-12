@@ -395,7 +395,7 @@
       "title": "Android <= 12 reports notifications as granted even when disabled, so the sync engine drops its background socket",
       "severity": "P0",
       "priority": "P0",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Push / Notifications",
       "component": "apps/mobile/src/infra/native/notifications.ts:21-23",
@@ -423,8 +423,9 @@
         "apps/mobile/android/app/src/main/java/com/velchat/push/PushNotifications.kt:173"
       ],
       "regression": false,
-      "notes": "Could not be observed in this run: no Android <= 12 device or AVD is available on this machine. Needs a real 3 GB Android 10 device to close.",
-      "jira": "VC-6"
+      "notes": "FIX: refreshPermission() (pushService.ts) trusted hasNotificationPermission() alone, which on Android <33 has no runtime dialog and unconditionally answers true regardless of the app-level or channel-level notification toggle the user can flip from system Settings. Combined it with the same native areMessageNotificationsBlocked() check the push blocker banner already used (getPushBlocker()), via a new pure decision function notificationsGranted(permitted, blocked) in pushState.ts, so permission now genuinely means the OS will show something on every API level before isPushAvailable lets the SyncEngine drop its background socket. No native code changed — reused the existing native primitive. Verified: full jest suite 456/456 pass (452 + 4 new), tsc --noEmit clean, eslint 0 errors on touched files. Could not be observed on a real Android <=12 device (none available on this machine) — the fix is verified at the unit-test level against the exact documented defect (permitted=true, blocked=true -> denied), not end-to-end on hardware.",
+      "jira": "VC-6",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-013",

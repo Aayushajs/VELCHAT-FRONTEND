@@ -34,6 +34,7 @@ import { nativePush } from './nativePush';
 import {
   INITIAL_PUSH_STATUS,
   isPushAvailable,
+  notificationsGranted,
   reducePush,
   registrationKey,
   shouldRegister,
@@ -394,7 +395,17 @@ async function askForNotificationsOnce(): Promise<void> {
 
 async function refreshPermission(): Promise<void> {
   if (status.phase === 'unsupported') return;
-  const granted = await hasNotificationPermission();
+  // VC-012: hasNotificationPermission() alone is not enough on Android <33, where there is no
+  // runtime dialog and it unconditionally answers `true` — it cannot see the app-level or
+  // channel-level toggle the user can flip from system Settings at any time. Combine it with
+  // the same native "will a message notification actually display" check the push blocker
+  // banner already uses (getPushBlocker() below), so `permission` genuinely means "the OS will
+  // let us show something" on every API level, matching what `isPushAvailable` requires of it.
+  const [permitted, blocked] = await Promise.all([
+    hasNotificationPermission(),
+    nativePush.areMessageNotificationsBlocked(),
+  ]);
+  const granted = notificationsGranted(permitted, blocked);
   const before = status.permission;
   apply({ type: 'permission', permission: granted ? 'granted' : 'denied' });
   // A re-grant does not need a re-registration (the token never went away), but it DOES change

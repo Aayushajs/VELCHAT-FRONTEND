@@ -114,6 +114,23 @@ export function reducePush(s: PushStatus, e: PushEvent): PushStatus {
 }
 
 /**
+ * May we actually SHOW something? `permitted` is the raw runtime-dialog answer
+ * (`hasNotificationPermission()`) — on Android <33 there is no such dialog, so it is
+ * unconditionally `true` and says nothing about whether the user later switched the app's
+ * notifications off in system Settings. `blocked` is the native, every-API-level check
+ * (`areMessageNotificationsBlocked()`, the same one the push blocker banner uses) that DOES see
+ * that (VC-012: the socket-gating state used to trust `permitted` alone, so a pre-33 device with
+ * notifications disabled looked "granted" and the SyncEngine dropped its background socket —
+ * total silence, since nothing could show a notification either).
+ */
+export function notificationsGranted(
+  permitted: boolean,
+  blocked: boolean,
+): boolean {
+  return permitted && !blocked;
+}
+
+/**
  * May the SyncEngine release its background socket? Only when a push can genuinely reach this
  * user: registered with the backend, holding that token, and allowed to display it.
  */
