@@ -18,7 +18,7 @@ import {
 import { clearProfileCache, clearContactAvatarCache } from '../../user';
 import { clearContactsDiscoveryCache } from '../../contacts';
 import { clearConversationPeerCache, clearStartDmCache } from '../../chat';
-import { shutdownPushForSignOut } from '../../notifications';
+import { shutdownPushForSignOut, startPushRuntime } from '../../notifications';
 import { logout } from '../api/authApi';
 import type { Tokens } from '../api/authApi';
 
@@ -42,6 +42,57 @@ interface AuthStore {
   provision: (tokens: Tokens) => void;
   signOut: () => void;
   sessionExpired: () => void;
+}
+
+/**
+ * Every LOCAL data purge that must happen when this device stops representing an account —
+ * shared between a user-initiated sign-out and a server-forced session expiry (VC-013). A forced
+ * expiry used to only flip the state machine, leaving the chat DB, profile mirror, phone number,
+ * contact graph and receipts in place for whichever account signs in next on this device.
+ *
+ * Deliberately EXCLUDES two things that differ by caller and are applied by them instead:
+ *   - the best-effort server-side `/auth/logout` call — pointless here, since a session that
+ *     just got authoritatively rejected has nothing left to revoke;
+ *   - `clearDeviceKey()` — a forced expiry keeps the device key so a later cold launch can still
+ *     silently re-provision if the session was merely stale, not genuinely over. Only a
+ *     user-initiated sign-out demands a fresh OTP.
+ */
+function purgeAccountData(): void {
+  void shutdownPushForSignOut().catch(() => undefined);
+  clearSession();
+  kv.delete(KVKeys.phone);
+  kv.delete(KVKeys.loginAt);
+  // Drop the mirrored profile so the next account never sees the previous one.
+  // MUST include every profile-mirror key — a miss leaks the prior user's data (e.g.
+  // `avatarUrl` fell through to the header/Settings on the next sign-in).
+  kv.delete(KVKeys.displayName);
+  kv.delete(KVKeys.email);
+  kv.delete(KVKeys.about);
+  kv.delete(KVKeys.avatarUri);
+  kv.delete(KVKeys.avatarUrl);
+  kv.delete(KVKeys.memberSince);
+  kv.delete(KVKeys.profileComplete);
+  // Wipe every other-account-specific cache so the NEXT sign-in starts clean and never sees
+  // this account's data: the New-Chat contacts snapshot, the discovery-registered marker, and
+  // — critically — the local chat DB (conversations/messages/outbox), which is NOT keyed by
+  // account and would otherwise carry over verbatim.
+  kv.delete(KVKeys.contactsSnapshot);
+  kv.delete(KVKeys.discoverySelfRegistered);
+  void purgeAllLocalChat().catch(() => undefined);
+  // Caches keyed by the PREVIOUS account's ids. These live outside the fixed key list — some
+  // are in-memory Maps, some are dynamically-keyed MMKV entries (`rcpt.*.<conversationId>`,
+  // `avatar.<accountId>`) — so no amount of `kv.delete(KVKeys.x)` reaches them, and leaving
+  // them behind hands the next sign-in this account's receipts, avatars and peer mappings.
+  clearAllReceipts();
+  clearProfileCache();
+  clearContactAvatarCache();
+  // Number -> accountId map built by OPRF discovery. Feature-owned, dynamically keyed, and
+  // full of the PREVIOUS account contact graph - it must not survive into the next sign-in.
+  clearContactsDiscoveryCache();
+  clearConversationPeerCache();
+  // "this DM already exists server-side" knowledge is per-account too — the next sign-in
+  // must re-create/re-seed its own DMs rather than assume this account's were enough.
+  clearStartDmCache();
 }
 
 export const useAuthStore = create<AuthStore>(set => ({
@@ -73,6 +124,12 @@ export const useAuthStore = create<AuthStore>(set => ({
     kv.set(KVKeys.deviceId, tokens.deviceId);
     // Stamp the sign-in time so the Profile page can show "last login".
     kv.set(KVKeys.loginAt, new Date().toISOString());
+    // App.tsx's mount effect starts the push runtime exactly ONCE for the life of the process.
+    // A sign-out tears it down (`shutdownPushForSignOut`); without this, a re-login later in the
+    // same process — no app restart — never brings it back, silently losing every notification
+    // action from then on (VC-011). `startPushRuntime()` is idempotent, so this is a harmless
+    // no-op on the app's normal first sign-in, which the mount effect already started.
+    startPushRuntime();
     set({ accountId: tokens.accountId, state: 'active' });
   },
 
@@ -80,55 +137,19 @@ export const useAuthStore = create<AuthStore>(set => ({
     // Best-effort server-side revoke (fire-and-forget) BEFORE we drop the local token.
     const refresh = getRefreshToken();
     if (refresh) void logout(refresh).catch(() => undefined);
-    // Un-register push while the bearer token is still valid, and — more importantly — clear
-    // the credentials mirrored into native storage. Those let a woken, JS-less process
-    // acknowledge deliveries; left behind, the NEXT account on this handset would acknowledge
-    // pushes addressed to the previous one. Fire-and-forget so sign-out never blocks on the
-    // network, but it must be started before `clearSession()` drops the token it needs.
-    void shutdownPushForSignOut().catch(() => undefined);
-    clearSession();
+    purgeAccountData();
     clearDeviceKey(); // full logout — next sign-in re-provisions via OTP (no silent relogin)
-    kv.delete(KVKeys.phone);
-    kv.delete(KVKeys.loginAt);
-    // Drop the mirrored profile so the next account never sees the previous one.
-    // MUST include every profile-mirror key — a miss leaks the prior user's data (e.g.
-    // `avatarUrl` fell through to the header/Settings on the next sign-in).
-    kv.delete(KVKeys.displayName);
-    kv.delete(KVKeys.email);
-    kv.delete(KVKeys.about);
-    kv.delete(KVKeys.avatarUri);
-    kv.delete(KVKeys.avatarUrl);
-    kv.delete(KVKeys.memberSince);
-    kv.delete(KVKeys.profileComplete);
-    // Wipe every other-account-specific cache so the NEXT sign-in starts clean and never sees
-    // this account's data: the New-Chat contacts snapshot, the discovery-registered marker, and
-    // — critically — the local chat DB (conversations/messages/outbox), which is NOT keyed by
-    // account and would otherwise carry over verbatim.
-    kv.delete(KVKeys.contactsSnapshot);
-    kv.delete(KVKeys.discoverySelfRegistered);
-    void purgeAllLocalChat().catch(() => undefined);
-    // Caches keyed by the PREVIOUS account's ids. These live outside the fixed key list — some
-    // are in-memory Maps, some are dynamically-keyed MMKV entries (`rcpt.*.<conversationId>`,
-    // `avatar.<accountId>`) — so no amount of `kv.delete(KVKeys.x)` reaches them, and leaving
-    // them behind hands the next sign-in this account's receipts, avatars and peer mappings.
-    clearAllReceipts();
-    clearProfileCache();
-    clearContactAvatarCache();
-    // Number -> accountId map built by OPRF discovery. Feature-owned, dynamically keyed, and
-    // full of the PREVIOUS account contact graph - it must not survive into the next sign-in.
-    clearContactsDiscoveryCache();
-    clearConversationPeerCache();
-    // "this DM already exists server-side" knowledge is per-account too — the next sign-in
-    // must re-create/re-seed its own DMs rather than assume this account's were enough.
-    clearStartDmCache();
     set({ state: 'signed_out', accountId: null, sessionId: null, phone: null });
   },
 
   // Refresh failed / token revoked mid-session (the network client already cleared the
   // tokens). Reflect it in the state machine so the navigator can reactively send the user
-  // back to sign-in instead of stranding them on a zombie "logged-in" screen. The device
-  // key is kept, so a later cold-launch can still silent-relogin if it's still valid.
+  // back to sign-in instead of stranding them on a zombie "logged-in" screen — and purge this
+  // account's data exactly like a sign-out (VC-013), so the NEXT sign-in on this device (which
+  // may be a different phone number entirely) never inherits it. The device key is kept, so a
+  // later cold-launch can still silent-relogin if the session was merely stale.
   sessionExpired: () => {
-    set({ state: 'signed_out', accountId: null, sessionId: null });
+    purgeAccountData();
+    set({ state: 'signed_out', accountId: null, sessionId: null, phone: null });
   },
 }));

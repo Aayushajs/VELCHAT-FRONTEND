@@ -41,6 +41,7 @@ import {
   getNetworkStatus,
   subscribeAppState,
   isAppError,
+  AppError,
   sendChatMessage,
   fetchMessagesAfter,
   fetchPeerReceipts,
@@ -1146,6 +1147,18 @@ class SyncEngine {
         }
         try {
           const ack = await sendChatMessage(item.input);
+          // A 2xx with no usable seq (`normalizeSendAck` defaults a missing/NaN one to 0) is a
+          // server-side anomaly, not a successful send (VC-022): `seq > 0` filters elsewhere (the
+          // cursor, `applyReceipt`) would make this row invisible forever — un-tickable, and the
+          // WS echo for the same message could never collapse into it either, leaving a permanent
+          // phantom duplicate. Route it through the SAME retry path as any other send failure
+          // instead of writing a state the rest of the system can never recover.
+          if (!(ack.seq > 0)) {
+            throw new AppError(
+              'server',
+              'Send acknowledged with no usable seq',
+            );
+          }
           await markMessageSent(item.clientMsgId, ack);
           await markAckd(item.id);
           // The peer may have acknowledged this message BEFORE our own ack came back — the

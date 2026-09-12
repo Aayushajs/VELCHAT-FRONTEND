@@ -358,7 +358,7 @@
       "title": "Sign-out then sign-in in one process silently destroys every notification action",
       "severity": "P0",
       "priority": "P0",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Push / Notifications",
       "component": "apps/mobile/src/app/App.tsx:133-136 + features/notifications/model/pushRuntime.ts:148-159",
@@ -386,8 +386,9 @@
         "apps/mobile/src/infra/push/pushService.ts:224-234,338-348,649"
       ],
       "regression": false,
-      "notes": "",
-      "jira": "VC-5"
+      "notes": "FIX: provision() now calls startPushRuntime() too (idempotent — harmless no-op on the normal first sign-in the App.tsx mount effect already started). A re-login after shutdownPushForSignOut() (sign-out) in the same process now correctly re-establishes the availability/message/session subscriptions instead of leaving them permanently torn down. Verified: full jest suite 455/455 pass, tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-5",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-012",
@@ -430,7 +431,7 @@
       "title": "clearSession() is not a session teardown — the previous account's chat DB, profile and contacts survive into the next sign-in",
       "severity": "P0",
       "priority": "P0",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Authentication / Data isolation",
       "component": "apps/mobile/src/infra/network/tokens.ts:179-187",
@@ -457,8 +458,9 @@
         "apps/mobile/src/features/auth/model/authStore.ts:88-123"
       ],
       "regression": false,
-      "notes": "",
-      "jira": "VC-7"
+      "notes": "FIX: sessionExpired() now runs the same purgeAccountData() as signOut() (extracted, shared), minus clearDeviceKey() (a transient expiry must still allow a later silent relogin) and the network logout call (pointless — the session is already rejected). The next sign-in on this device, even under a different phone number, no longer inherits the previous account chat DB, profile, contacts or receipts. Verified: full jest suite 455/455 pass, tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-7",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-014",
@@ -733,7 +735,7 @@
       "title": "A SendAck with seq 0 leaves the message permanently un-tickable and permanently duplicated",
       "severity": "P1",
       "priority": "P1",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Messaging / Send",
       "component": "apps/mobile/src/infra/network/chat.ts:140 -> infra/db/messages.ts:373",
@@ -759,8 +761,9 @@
         "apps/mobile/src/infra/db/messages.ts:356,373,444,485"
       ],
       "regression": false,
-      "notes": "normalizeSendAck has no test file at all.",
-      "jira": "VC-22"
+      "notes": "normalizeSendAck has no test file at all. FIX: The outbox drain now rejects a SendAck with no usable seq (ack.seq is not > 0) as a retryable server-kind AppError instead of writing it as a successful send — routes through the exact same retry path as any other transient send failure, so the row never gets stuck permanently un-tickable/duplicated. Verified: full jest suite 455/455 pass, tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-22",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-023",
@@ -1168,7 +1171,7 @@
       "title": "A misbuilt binary reports env:'dev' while talking to production",
       "severity": "P2",
       "priority": "P2",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Configuration",
       "component": "apps/mobile/src/core/config/env.ts:20-31",
@@ -1194,8 +1197,9 @@
         "apps/mobile/src/infra/network/client.ts:45"
       ],
       "regression": false,
-      "notes": "The prod URL fallback direction is defensible; make `name` fall back to 'prod' alongside it, or log.error when Config.API_BASE_URL is absent.",
-      "jira": "VC-35"
+      "notes": "The prod URL fallback direction is defensible; make `name` fall back to 'prod' alongside it, or log.error when Config.API_BASE_URL is absent. FIX: Extracted the pure resolveAppEnv(rawName, rawApiBaseUrl, rawWsUrl) so the fallback logic is unit-testable. An unrecognised/missing ENV now falls back to 'prod' alongside the URL fallback (previously 'dev'), so a misbuilt binary can never report a safe-sounding name while actually pointing at production. Verified: full jest suite 455/455 pass, tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-35",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-036",

@@ -797,6 +797,33 @@ describe('a send the server refuses', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]?.state).toBe('sending');
   });
+
+  // VC-022: a 2xx SendAck with no usable seq (missing/NaN, normalizeSendAck defaults to 0) used
+  // to be treated as a full success — the row flipped to `sent` with seq 0. The `seq > 0` filters
+  // elsewhere (the cursor, applyReceipt) then made that row invisible forever: it could never be
+  // ticked again, and the WS echo for the same message could never collapse into it either,
+  // leaving a permanent phantom duplicate. It must be treated exactly like any other send the
+  // engine cannot trust — retryable, clock icon, never silently "succeeded".
+  it('treats a SendAck with no usable seq as a retryable failure, not a silent success', async () => {
+    mockSendChat.mockImplementation(() =>
+      Promise.resolve({ messageId: 'srv_no_seq', seq: 0, serverTs: T0 }),
+    );
+    await bootConnected();
+
+    await syncEngine.sendText(conv, ME, 'ack with no seq');
+    await until(
+      () => mockSendChat.mock.calls.length >= 1,
+      'the first transmit attempt',
+    );
+    await settle();
+
+    const rows = await messagesOf(conv);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.state).not.toBe('sent');
+    // The row is never ticked from an unusable ack — its seq stays whatever it was before the
+    // attempt (unset), never a false positive value.
+    expect((rows[0]?.seq ?? 0) > 0).toBe(false);
+  });
 });
 
 // ── 7. unread counts ─────────────────────────────────────────────────────────
