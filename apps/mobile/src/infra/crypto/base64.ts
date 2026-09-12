@@ -9,6 +9,14 @@ const ALPHABET =
 const LOOKUP = new Int16Array(256).fill(-1);
 for (let i = 0; i < ALPHABET.length; i++) LOOKUP[ALPHABET.charCodeAt(i)] = i;
 
+/** Base64url (RFC 4648 §5): `+`/`/` -> `-`/`_`, no padding. Used for JWK members (RFC 8037/7638). */
+export function bytesToBase64Url(bytes: Uint8Array): string {
+  return bytesToBase64(bytes)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/[=]+$/, '');
+}
+
 export function bytesToBase64(bytes: Uint8Array): string {
   let out = '';
   for (let i = 0; i < bytes.length; i += 3) {

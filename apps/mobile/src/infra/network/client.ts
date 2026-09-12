@@ -17,13 +17,13 @@ import { appEnv, log, isFlightMode } from '../../core';
 import { AppError, normalizeError } from './errors';
 import {
   getAccessToken,
-  getCnfJkt,
   getRefreshToken,
   getTenantId,
   setTokens,
   clearSession,
   type SessionTokens,
 } from './tokens';
+import { cnfJktThumbprint } from '../crypto/deviceKey';
 
 const CLIENT_VERSION = '0.0.1';
 // 60s tolerates Render free-tier cold-starts (a sleeping service takes ~40-50s to
@@ -132,6 +132,13 @@ function backoffMs(attempt: number): number {
 const wait = (ms: number): Promise<void> =>
   new Promise(resolve => setTimeout(resolve, ms));
 
+// A `Retry-After` header is server input, not a client budget — a legal, trivially injectable
+// value like `86400` (24h) must never be allowed to park a request that long. This is the same
+// order of magnitude as `DEFAULT_TIMEOUT` (a request the user is actively waiting on shouldn't
+// sit idle far past what a timeout would already have ended), giving the UI a chance to show the
+// wait/cooldown and move on rather than appearing hung (VC-034).
+const MAX_RETRY_AFTER_MS = 10_000;
+
 // --- single-flight refresh --------------------------------------------------
 /**
  * Why this is a three-way outcome and not `string | null`:
@@ -164,7 +171,7 @@ async function doRefresh(): Promise<RefreshOutcome> {
     // bare axios (no interceptors) to avoid recursion
     const res = await axios.post(
       `${appEnv.apiBaseUrl}/auth/token/refresh`,
-      { refreshToken: refresh, cnfJkt: getCnfJkt() },
+      { refreshToken: refresh, cnfJkt: cnfJktThumbprint() },
       {
         timeout: DEFAULT_TIMEOUT,
         headers: { 'Content-Type': 'application/json' },
@@ -181,7 +188,7 @@ async function doRefresh(): Promise<RefreshOutcome> {
       return { status: 'unavailable' };
     }
     const next: SessionTokens = { access: data.access, refresh: data.refresh };
-    const jkt = getCnfJkt();
+    const jkt = cnfJktThumbprint();
     if (jkt) next.cnfJkt = jkt;
     setTokens(next);
     return { status: 'ok', access: data.access };
@@ -223,27 +230,40 @@ export const api: AxiosInstance = axios.create({
   headers: { 'Content-Type': 'application/json' },
 });
 
-api.interceptors.request.use(config => {
-  // Flight mode: don't touch the network at all — fail fast with a clean offline error.
-  if (isFlightMode()) {
-    return Promise.reject(
-      new AppError(
-        'network',
-        "You're offline (flight mode). Turn it off to reconnect.",
-        { retryable: true },
-      ),
-    );
-  }
-  const token = getAccessToken();
-  if (token) config.headers.set('Authorization', `Bearer ${token}`);
-  const tenant = getTenantId();
-  if (tenant) config.headers.set('x-tenant-id', tenant);
-  config.headers.set('x-request-id', traceId());
-  config.headers.set('x-client-version', CLIENT_VERSION);
-  (config as RetryConfig).__t0 = Date.now();
-  traceReq(config.method, config.url);
-  return config;
-});
+api.interceptors.request.use(
+  config => {
+    // Flight mode: don't touch the network at all — fail fast with a clean offline error.
+    if (isFlightMode()) {
+      return Promise.reject(
+        new AppError(
+          'network',
+          "You're offline (flight mode). Turn it off to reconnect.",
+          { retryable: true },
+        ),
+      );
+    }
+    const token = getAccessToken();
+    if (token) config.headers.set('Authorization', `Bearer ${token}`);
+    const tenant = getTenantId();
+    if (tenant) config.headers.set('x-tenant-id', tenant);
+    config.headers.set('x-request-id', traceId());
+    config.headers.set('x-client-version', CLIENT_VERSION);
+    (config as RetryConfig).__t0 = Date.now();
+    traceReq(config.method, config.url);
+    return config;
+  },
+  undefined,
+  // VC-010: this body is synchronous top to bottom (the one Promise it can return is a REJECTION,
+  // which axios handles the same way either way). Without `synchronous:true` axios defers even a
+  // fully synchronous interceptor into a microtask — so a caller that fires an authenticated
+  // request and then synchronously clears the session on the very next line (sign-out's
+  // best-effort revoke calls, issued "while the token is still valid") has that token deleted
+  // before this interceptor ever reads it, and the request goes out unauthenticated. Declaring it
+  // synchronous makes axios invoke it INLINE at the moment the request is issued, so it reads
+  // whatever token was current at that exact call site — which is the whole point of issuing the
+  // call before the clear.
+  { synchronous: true },
+);
 
 api.interceptors.response.use(
   (res: AxiosResponse) => {
@@ -308,7 +328,13 @@ api.interceptors.response.use(
     if (status === 429 && config && !config.__retryCount && idempotent) {
       config.__retryCount = 1;
       const retryAfter = Number(error.response?.headers['retry-after']);
-      await wait(Number.isFinite(retryAfter) ? retryAfter * 1000 : 1000);
+      const requestedMs = Number.isFinite(retryAfter)
+        ? retryAfter * 1000
+        : 1000;
+      // Clamp to [0, MAX_RETRY_AFTER_MS]: a negative header waits not at all, a hostile or
+      // merely huge one waits no longer than the ceiling above.
+      const waitMs = Math.min(Math.max(requestedMs, 0), MAX_RETRY_AFTER_MS);
+      await wait(waitMs);
       return api.request(config);
     }
 

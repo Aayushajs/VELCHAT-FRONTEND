@@ -12,6 +12,7 @@
 import type { AxiosRequestConfig } from 'axios';
 
 import { kv, KVKeys } from '../../kv';
+import { ensureDeviceKey } from '../../crypto/deviceKey';
 import { api, refreshSession } from '../client';
 import {
   clearSession,
@@ -115,6 +116,7 @@ beforeEach(() => {
   kv.delete(KVKeys.accessToken);
   kv.delete(KVKeys.refreshToken);
   kv.delete(KVKeys.cnfJkt);
+  kv.delete(KVKeys.devicePrivKey);
 });
 
 describe('VC-036 — the cold-start bootstrap must not treat an EXPIRED access token as usable', () => {
@@ -164,6 +166,11 @@ describe('VC-036 — the cold-start bootstrap must not treat an EXPIRED access t
 
 describe('VC-015 — the refresh request must carry a real cnfJkt device binding', () => {
   it('sends a non-empty cnfJkt thumbprint on POST /auth/token/refresh', async () => {
+    // A signed-in device always has a key by the time it can refresh — sign-in itself is either
+    // OTP+register (which sends `devicePubkeyBase64`) or device-key login (which needs one to
+    // sign the challenge). `ensureDeviceKey()` here just makes that precondition explicit, the
+    // same way `setTokens` below makes "a session exists" explicit.
+    ensureDeviceKey();
     setTokens({
       accountId: 'acct-1',
       deviceId: 'dev-1',

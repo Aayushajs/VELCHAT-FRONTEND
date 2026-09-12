@@ -323,7 +323,7 @@
       "title": "Sign-out's authenticated calls ship with no Authorization header, so the server-side push endpoint is never cleared",
       "severity": "P1",
       "priority": "P1",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Authentication / Push",
       "component": "apps/mobile/src/features/auth/model/authStore.ts:79-89",
@@ -349,8 +349,9 @@
         "apps/mobile/src/infra/network/client.ts:226-246"
       ],
       "regression": false,
-      "notes": "",
-      "jira": "VC-16"
+      "notes": "FIX: The request interceptor is now registered with {synchronous:true} (client.ts), so axios invokes it INLINE at the moment a request is issued instead of deferring it into a microtask. A call fired immediately before a synchronous clearSession() now reads the still-current token, closing the race. Verified: full jest suite 454/454 pass, tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-16",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-011",
@@ -500,7 +501,7 @@
       "title": "The cnfJkt DPoP binding is dead code — the refresh token is bound to nothing",
       "severity": "P1",
       "priority": "P1",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Security / Tokens",
       "component": "apps/mobile/src/infra/network/client.ts:167,184-185 + tokens.ts:172",
@@ -527,8 +528,9 @@
         "docs/backend-integration-reference.md §3"
       ],
       "regression": false,
-      "notes": "",
-      "jira": "VC-18"
+      "notes": "FIX: Added cnfJktThumbprint() (deviceKey.ts) — a real RFC 7638 JWK thumbprint (RFC 8037 OKP encoding) over the device Ed25519 public key. doRefresh() now computes it fresh on every refresh instead of round-tripping through an MMKV key nothing ever wrote a real value into. Verified: full jest suite 454/454 pass, tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-18",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-016",
@@ -1137,7 +1139,7 @@
       "title": "Retry-After is honored with an unbounded, uncancellable sleep",
       "severity": "P2",
       "priority": "P2",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Networking",
       "component": "apps/mobile/src/infra/network/client.ts:308-312",
@@ -1157,8 +1159,9 @@
       "evidence": ["QA/_audit/auth-network-push-audit.md#d5"],
       "refs": ["apps/mobile/src/infra/network/client.ts:308-312,321-327"],
       "regression": false,
-      "notes": "",
-      "jira": "VC-34"
+      "notes": "FIX: Retry-After is now clamped to [0, 10s] (MAX_RETRY_AFTER_MS, client.ts) before the wait, instead of obeying a server-supplied value unbounded. Verified: full jest suite 454/454 pass, tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-34",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-035",
