@@ -238,6 +238,12 @@ async function createIssue(bug) {
     description: describe(bug),
     labels: labelsFor(bug),
   };
+  // Optional: the registry can name a specific owner (bug.assigneeAccountId, a Jira accountId —
+  // resolve it once via /rest/api/3/user/assignable/search?project=<key> and paste it in,
+  // never guess one from a display name).
+  if (bug.assigneeAccountId) {
+    fields.assignee = { accountId: bug.assigneeAccountId };
+  }
   try {
     return await jira('/issue', {
       method: 'POST',

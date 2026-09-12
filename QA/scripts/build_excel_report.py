@@ -506,11 +506,12 @@ def sheet_bugs(wb: Workbook, resolved_bugs: list[dict], latest: dict[str, dict])
         "Feature", "Component", "Environment", "Device", "OS", "Frequency", "Reproducibility",
         "Preconditions", "Steps to Reproduce", "Expected", "Actual", "User Impact",
         "Suspected Cause", "Root Cause", "Evidence", "First Seen", "Last Seen", "Regression", "Notes",
+        "Assignee",
     ]
     write_header(ws, headers)
     set_widths(
         ws,
-        [10, 12, 22, 60, 10, 10, 16, 11, 20, 34, 28, 20, 16, 22, 24, 34, 60, 52, 60, 44, 48, 40, 38, 13, 13, 12, 44],
+        [10, 12, 22, 60, 10, 10, 16, 11, 20, 34, 28, 20, 16, 22, 24, 34, 60, 52, 60, 44, 48, 40, 38, 13, 13, 12, 44, 20],
     )
 
     row = 2
@@ -551,6 +552,7 @@ def sheet_bugs(wb: Workbook, resolved_bugs: list[dict], latest: dict[str, dict])
             last_seen,
             "Yes" if b.get("regression") else "No",
             as_text(b.get("notes")),
+            b.get("assignee", ""),
         ]
         for col, value in enumerate(values, start=1):
             cell = ws.cell(row=row, column=col, value=value)
