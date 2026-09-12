@@ -11,6 +11,7 @@ import {
   addColumns,
   unsafeExecuteSql,
 } from '@nozbe/watermelondb/Schema/migrations';
+import { COMPOSITE_INDEXES } from './compositeIndexes';
 
 export const migrations = schemaMigrations({
   migrations: [
@@ -42,39 +43,13 @@ export const migrations = schemaMigrations({
        * `unsafeExecuteSql` is the only way to add an index to an EXISTING table: WatermelonDB's
        * `isIndexed` flag is applied at table-creation time and does nothing on migration. Each
        * statement is `IF NOT EXISTS`, so re-running a migration is harmless.
+       *
+       * These are the SAME statements `schema.ts`'s `unsafeSql` hook applies on a fresh install
+       * (VC-024) — shared from `compositeIndexes.ts` so an upgraded install and a new one can
+       * never end up with a different index set.
        */
       toVersion: 3,
-      steps: [
-        // Chat list: WHERE is_archived AND last_message_at > 0 ORDER BY is_pinned DESC,
-        // last_message_at DESC. Column order mirrors the query — equality, then sort keys.
-        unsafeExecuteSql(
-          'CREATE INDEX IF NOT EXISTS conversations_list_idx ' +
-            'ON conversations (is_archived, is_pinned, last_message_at);',
-        ),
-        // Chat window: WHERE conversation_id = ? AND deleted = 0 ORDER BY created_at DESC LIMIT n.
-        // Without this, opening a long conversation scans that chat's whole history and sorts it
-        // in memory before taking fifty rows.
-        unsafeExecuteSql(
-          'CREATE INDEX IF NOT EXISTS messages_window_idx ' +
-            'ON messages (conversation_id, deleted, created_at);',
-        ),
-        // Inbound dedup: WHERE conversation_id IN (…) AND seq IN (…), run for every applied batch.
-        unsafeExecuteSql(
-          'CREATE INDEX IF NOT EXISTS messages_conv_seq_idx ' +
-            'ON messages (conversation_id, seq);',
-        ),
-        // Receipts: WHERE conversation_id = ? AND sender_id = ? AND seq <= ?. `sender_id` was not
-        // indexed at all, so every receipt frame scanned the conversation.
-        unsafeExecuteSql(
-          'CREATE INDEX IF NOT EXISTS messages_receipt_idx ' +
-            'ON messages (conversation_id, sender_id, seq);',
-        ),
-        // Outbox claim: WHERE state IN (queued, sending), ordered by when it is next due.
-        unsafeExecuteSql(
-          'CREATE INDEX IF NOT EXISTS outbox_due_idx ' +
-            'ON outbox (state, next_attempt_at);',
-        ),
-      ],
+      steps: COMPOSITE_INDEXES.map(unsafeExecuteSql),
     },
   ],
 });

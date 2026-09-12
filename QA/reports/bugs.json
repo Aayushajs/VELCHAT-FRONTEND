@@ -468,7 +468,7 @@
       "title": "Rotating-refresh replay is structurally inevitable on a lost response, and the family revoke is then silently swallowed",
       "severity": "P1",
       "priority": "P1",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Authentication / Tokens",
       "component": "apps/mobile/src/infra/network/client.ts:160-197",
@@ -489,15 +489,16 @@
       "user_impact": "Unexplained logouts on a flaky network, and a revoked-family security event that never reaches the user or telemetry.",
       "suspected_cause": "No 'this refresh token was already submitted' marker in tokens.ts.",
       "rootCause": "Confirmed by code reading, and the server-side family revoke is confirmed by live test VC-AUTH-024.",
-      "testIds": [],
+      "testIds": ["authStore.test.ts: VC-014"],
       "evidence": ["QA/reports/results.jsonl", "QA/_audit/auth-network-push-audit.md#d3"],
       "refs": [
         "apps/mobile/src/infra/network/client.ts:160-197",
         "docs/backend-integration-reference.md:41"
       ],
       "regression": false,
-      "notes": "No automated test currently exercises the client-side claim (device re-login after a family revoke swallows the signal). VC-AUTH-024 was removed from testIds: it verifies the BACKEND's revoke-on-reuse behaviour (confirmed working since the first run) but says nothing about the client. Needs an RN-level test or a manual repro to close.",
-      "jira": "VC-17"
+      "notes": "FIX (investigated against the real backend source at D:Velchat, read-only): confirmed a refresh-reuse family revoke and a plain invalid/expired refresh both return an identical 401 UNAUTHORIZED with no distinguishing code, and confirmed device-key login is architecturally INDEPENDENT of the refresh-token family (revokeFamily only touches refresh_tokens; the devices table has no family_id) - so a device that still holds its private key can always mint a fresh session, and the client cannot and need not distinguish reuse-triggered revokes from ordinary rejections. Two real defects fixed: (1) clearSession() was deleting KVKeys.deviceId, which meant NEITHER the existing cold-start silent-relogin (useAuthBootstrap) NOR any warm recovery could ever actually reach /auth/challenge after a forced expiry, despite the code comments claiming this already worked - moved the explicit deviceId wipe into signOut() only, so a real logout is unchanged but a forced expiry now keeps it, same as the device key. (2) added attemptSilentRelogin() (authStore.ts), invoked from sessionExpired() itself, so a lost-refresh-response false-positive family revoke recovers IMMEDIATELY while the app is warm instead of only on the next cold start, turning a network hiccup back into nothing instead of stranding the user on the sign-in screen. Did not attempt to prevent the reuse-detection race itself (structurally requires a backend idempotency mechanism - out of scope, frontend-only per current instruction). Verified: full jest suite 481/481 pass, tsc --noEmit clean, eslint 0 errors. No RN-level test existed before; added 4 new tests (authStore.test.ts) covering the success, no-device-key, device-revoked and sessionExpired-wiring paths - the second and third caught the deviceId-wipe bug during RED before the fix was written.",
+      "jira": "VC-17",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-015",
@@ -807,7 +808,7 @@
       "title": "Migration-v3's five composite indexes never exist on a fresh install",
       "severity": "P2",
       "priority": "P2",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Local DB / Performance",
       "component": "apps/mobile/src/infra/db/migrations.ts:46-77",
@@ -826,15 +827,16 @@
       "user_impact": "Slower list queries on exactly the devices the §M0 budgets target, and a performance profile that differs between a fresh install and an upgrade.",
       "suspected_cause": "Index creation placed in a migration rather than in the schema definition.",
       "rootCause": "Confirmed by code reading (WatermelonDB adapters/sqlite/index.js:143-144,199; encodeSchema/index.js:22).",
-      "testIds": ["VC-UNIT-205"],
+      "testIds": ["schema.test.ts: VC-024"],
       "evidence": ["QA/_audit/sync-db-audit.md"],
       "refs": [
         "apps/mobile/src/infra/db/migrations.ts:46-77",
         "apps/mobile/src/infra/db/__tests__/migrations.test.ts:43-53"
       ],
       "regression": false,
-      "notes": "migrations.test.ts tests the declaration, not the effect.",
-      "jira": "VC-24"
+      "notes": "FIX: added an unsafeSql hook to schema.ts (appSchema) — WatermelonDB's own supported extension point, confirmed by reading adapters/sqlite/encodeSchema/index.js (encodeSchema calls unsafeSql(sql, \"setup\") for a fresh install) — that appends the same five composite CREATE INDEX statements the v3 migration already applies on an upgrade. Extracted the five statements into a new shared compositeIndexes.ts so migrations.ts and schema.ts can never drift apart, and migrations.ts now maps over that same array instead of repeating the SQL inline. Verified: full jest suite 481/481 pass (3 new tests in schema.test.ts assert the hook exists, appends every composite index on kind:\"setup\", and leaves other DDL kinds untouched), tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-24",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-025",

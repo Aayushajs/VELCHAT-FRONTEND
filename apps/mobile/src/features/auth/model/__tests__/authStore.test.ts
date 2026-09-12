@@ -29,6 +29,8 @@ jest.mock('../../../chat', () => ({
 }));
 jest.mock('../../api/authApi', () => ({
   logout: jest.fn(() => Promise.resolve()),
+  requestChallenge: jest.fn(),
+  loginWithDeviceKey: jest.fn(),
 }));
 jest.mock('../../../../infra', () => {
   const actual = jest.requireActual('../../../../infra');
@@ -40,7 +42,7 @@ jest.mock('../../../../infra', () => {
   };
 });
 
-import { kv, KVKeys, setTokens } from '../../../../infra';
+import { kv, KVKeys, setTokens, ensureDeviceKey } from '../../../../infra';
 import {
   shutdownPushForSignOut,
   startPushRuntime,
@@ -48,7 +50,8 @@ import {
 import { clearProfileCache, clearContactAvatarCache } from '../../../user';
 import { clearContactsDiscoveryCache } from '../../../contacts';
 import { clearConversationPeerCache, clearStartDmCache } from '../../../chat';
-import { useAuthStore } from '../authStore';
+import { requestChallenge, loginWithDeviceKey } from '../../api/authApi';
+import { useAuthStore, attemptSilentRelogin } from '../authStore';
 import * as infra from '../../../../infra';
 
 const mocked = {
@@ -62,6 +65,8 @@ const mocked = {
   clearContactsDiscoveryCache: clearContactsDiscoveryCache as jest.Mock,
   clearConversationPeerCache: clearConversationPeerCache as jest.Mock,
   clearStartDmCache: clearStartDmCache as jest.Mock,
+  requestChallenge: requestChallenge as jest.Mock,
+  loginWithDeviceKey: loginWithDeviceKey as jest.Mock,
 };
 
 /** Populate every key + cache a signed-in account leaves behind, exactly like a real session. */
@@ -178,5 +183,95 @@ describe('VC-011 — a sign-in after a sign-out (same process) must bring push b
     });
 
     expect(mocked.startPushRuntime).toHaveBeenCalled();
+  });
+});
+
+describe('VC-014 — a forced expiry should recover silently while the app is still warm', () => {
+  it('attemptSilentRelogin() re-provisions from a device key without ever asking the user', async () => {
+    seedPreviousAccountState(); // sets deviceId via setTokens()
+    ensureDeviceKey();
+    mocked.requestChallenge.mockResolvedValue({ nonce: 'server-nonce' });
+    mocked.loginWithDeviceKey.mockResolvedValue({
+      accountId: 'prev-account',
+      deviceId: 'prev-device',
+      access: 'new-access-token',
+      refresh: 'new-refresh-token',
+      expiresIn: 900,
+    });
+
+    const ok = await attemptSilentRelogin();
+
+    expect(ok).toBe(true);
+    expect(mocked.requestChallenge).toHaveBeenCalledWith('prev-device');
+    expect(useAuthStore.getState().state).toBe('active');
+    expect(useAuthStore.getState().accountId).toBe('prev-account');
+  });
+
+  it('is a no-op when this install has no device key yet', async () => {
+    // The state sessionExpired() itself would already have set, BEFORE calling this — verifying
+    // attemptSilentRelogin() in isolation must not assume anything about who called it.
+    useAuthStore.setState({
+      state: 'signed_out',
+      accountId: null,
+      phone: null,
+    });
+    setTokens({
+      access: 'a',
+      refresh: 'r',
+      accountId: 'prev-account',
+      deviceId: 'prev-device',
+    });
+    // No ensureDeviceKey() — nothing to sign a challenge with.
+
+    const ok = await attemptSilentRelogin();
+
+    expect(ok).toBe(false);
+    expect(mocked.requestChallenge).not.toHaveBeenCalled();
+    expect(useAuthStore.getState().state).toBe('signed_out');
+  });
+
+  it('stays signed out — not stuck mid-flow — when the device itself was revoked', async () => {
+    useAuthStore.setState({
+      state: 'signed_out',
+      accountId: null,
+      phone: null,
+    });
+    setTokens({
+      access: 'a',
+      refresh: 'r',
+      accountId: 'prev-account',
+      deviceId: 'prev-device',
+    });
+    ensureDeviceKey();
+    mocked.requestChallenge.mockResolvedValue({ nonce: 'server-nonce' });
+    mocked.loginWithDeviceKey.mockRejectedValue(new Error('device revoked'));
+
+    const ok = await attemptSilentRelogin();
+
+    expect(ok).toBe(false);
+    expect(useAuthStore.getState().state).toBe('signed_out');
+  });
+
+  it('sessionExpired() triggers the silent relogin attempt', async () => {
+    seedPreviousAccountState();
+    ensureDeviceKey();
+    mocked.requestChallenge.mockResolvedValue({ nonce: 'server-nonce' });
+    mocked.loginWithDeviceKey.mockResolvedValue({
+      accountId: 'prev-account',
+      deviceId: 'prev-device',
+      access: 'new-access-token',
+      refresh: 'new-refresh-token',
+      expiresIn: 900,
+    });
+
+    useAuthStore.getState().sessionExpired();
+    // sessionExpired() fires it without awaiting (the state flip must not block on the network);
+    // flush the microtask queue so the two `await`s inside attemptSilentRelogin settle.
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mocked.requestChallenge).toHaveBeenCalledWith('prev-device');
+    expect(useAuthStore.getState().state).toBe('active');
   });
 });

@@ -8,9 +8,19 @@
  * reactions, attachments, …) are stored as strings and parsed at the model boundary.
  */
 import { appSchema, tableSchema } from '@nozbe/watermelondb';
+import { COMPOSITE_INDEXES } from './compositeIndexes';
 
 export const schema = appSchema({
   version: 3,
+  // VC-024: WatermelonDB only runs the migration chain on an UPGRADE — a brand-new install
+  // takes the `_setUpWithSchema` path, which emits DDL from this file ALONE and never touches
+  // migrations.ts. The v3 migration's composite indexes (`unsafeExecuteSql`) therefore only
+  // ever existed on installs that upgraded through it, the inverse of what §M0's
+  // worst-device-first budget needs. `unsafeSql` is WatermelonDB's own hook for exactly this:
+  // it receives the schema's generated DDL and may append to it before the fresh-install
+  // `'setup'` DDL runs, so the composite indexes below now come with a new install too.
+  unsafeSql: (sql, kind) =>
+    kind === 'setup' ? sql + COMPOSITE_INDEXES.join('') : sql,
   tables: [
     tableSchema({
       name: 'conversations',

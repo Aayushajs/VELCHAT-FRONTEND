@@ -195,12 +195,23 @@ export function setTokens(t: SessionTokens): void {
   if (sessionIdentity() !== before) emitSession(true);
 }
 
+/**
+ * Wipe the token pair. Deliberately does NOT delete `KVKeys.deviceId` (VC-014): this runs both
+ * on a real sign-out AND on a forced expiry — including the rotating-refresh reuse-detected
+ * "family revoke", which is structurally reachable from a merely LOST refresh response (the
+ * client cannot tell "the server never saw it" from "it rotated and the reply never arrived"),
+ * not only a genuine compromise. The device row is entirely separate from that token family, so
+ * a device that still holds its private key can mint a fresh one immediately via
+ * `/auth/challenge` + `/auth/login/device-key` — but only if it still knows its OWN device id to
+ * put in that request. `setTokens()` always overwrites this on the next successful login/refresh
+ * regardless, so leaving it here costs nothing; a full sign-out that wants to look as if this
+ * device never had a session deletes it explicitly instead (see `authStore.signOut()`).
+ */
 export function clearSession(): void {
   const had = Boolean(kv.getString(KVKeys.accessToken));
   kv.delete(KVKeys.accessToken);
   kv.delete(KVKeys.refreshToken);
   kv.delete(KVKeys.cnfJkt);
   kv.delete(KVKeys.accountId);
-  kv.delete(KVKeys.deviceId);
   if (had) emitSession(false);
 }

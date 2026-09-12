@@ -10,6 +10,9 @@ import {
   clearSession,
   clearDeviceKey,
   getRefreshToken,
+  getDeviceId,
+  hasDeviceKey,
+  signChallenge,
   purgeAllLocalChat,
   clearAllReceipts,
   kv,
@@ -19,7 +22,7 @@ import { clearProfileCache, clearContactAvatarCache } from '../../user';
 import { clearContactsDiscoveryCache } from '../../contacts';
 import { clearConversationPeerCache, clearStartDmCache } from '../../chat';
 import { shutdownPushForSignOut, startPushRuntime } from '../../notifications';
-import { logout } from '../api/authApi';
+import { logout, requestChallenge, loginWithDeviceKey } from '../api/authApi';
 import type { Tokens } from '../api/authApi';
 
 export type AuthState =
@@ -50,12 +53,15 @@ interface AuthStore {
  * expiry used to only flip the state machine, leaving the chat DB, profile mirror, phone number,
  * contact graph and receipts in place for whichever account signs in next on this device.
  *
- * Deliberately EXCLUDES two things that differ by caller and are applied by them instead:
+ * Deliberately EXCLUDES things that differ by caller and are applied by them instead:
  *   - the best-effort server-side `/auth/logout` call — pointless here, since a session that
  *     just got authoritatively rejected has nothing left to revoke;
- *   - `clearDeviceKey()` — a forced expiry keeps the device key so a later cold launch can still
- *     silently re-provision if the session was merely stale, not genuinely over. Only a
- *     user-initiated sign-out demands a fresh OTP.
+ *   - `clearDeviceKey()` — a forced expiry keeps the device key so a silent re-provision can
+ *     still happen if the session was merely stale, not genuinely over. Only a user-initiated
+ *     sign-out demands a fresh OTP;
+ *   - the device id (VC-014, inside `clearSession()`) — needed alongside the device key to
+ *     actually ADDRESS that silent re-provision (`/auth/challenge` + `/auth/login/device-key`
+ *     both take it); `signOut()` deletes it explicitly instead.
  */
 function purgeAccountData(): void {
   void shutdownPushForSignOut().catch(() => undefined);
@@ -93,6 +99,36 @@ function purgeAccountData(): void {
   // "this DM already exists server-side" knowledge is per-account too — the next sign-in
   // must re-create/re-seed its own DMs rather than assume this account's were enough.
   clearStartDmCache();
+}
+
+/**
+ * Ask the device key to mint a brand-new session (VC-014).
+ *
+ * A forced expiry is not always a real revoke of THIS device: the backend's rotating refresh
+ * token detects reuse and revokes the whole token *family* whenever a client resubmits a token
+ * it already rotated out — which is structurally unavoidable after any refresh whose RESPONSE
+ * was lost (a timeout, a dropped connection), since the client cannot tell "the server never
+ * saw it" from "the server rotated it and the reply never arrived". The device row is entirely
+ * separate from that family (confirmed against the backend: revoking a family only touches
+ * `refresh_tokens`, never the device), so a device that still holds its private key can always
+ * get back in immediately. Trying this the moment the session is forced out — not only on the
+ * next cold start (`useAuthBootstrap`) — turns a network hiccup back into nothing instead of
+ * stranding the user on the sign-in screen until they happen to relaunch the app.
+ */
+export async function attemptSilentRelogin(): Promise<boolean> {
+  try {
+    const deviceId = getDeviceId();
+    if (!hasDeviceKey() || !deviceId) return false;
+    const { nonce } = await requestChallenge(deviceId);
+    const signature = signChallenge(nonce);
+    const tokens = await loginWithDeviceKey(deviceId, signature);
+    useAuthStore.getState().provision(tokens);
+    return true;
+  } catch {
+    // No device key, no network, or the device itself was revoked — stay signed out exactly as
+    // before this existed; onboarding handles a fresh sign-in.
+    return false;
+  }
 }
 
 export const useAuthStore = create<AuthStore>(set => ({
@@ -139,6 +175,10 @@ export const useAuthStore = create<AuthStore>(set => ({
     if (refresh) void logout(refresh).catch(() => undefined);
     purgeAccountData();
     clearDeviceKey(); // full logout — next sign-in re-provisions via OTP (no silent relogin)
+    // clearSession() (inside purgeAccountData) deliberately keeps the device id for a forced
+    // expiry's benefit (VC-014) — an intentional sign-out has no such use for it, so drop it
+    // explicitly here to keep this path's end state exactly as before that change.
+    kv.delete(KVKeys.deviceId);
     set({ state: 'signed_out', accountId: null, sessionId: null, phone: null });
   },
 
@@ -146,10 +186,15 @@ export const useAuthStore = create<AuthStore>(set => ({
   // tokens). Reflect it in the state machine so the navigator can reactively send the user
   // back to sign-in instead of stranding them on a zombie "logged-in" screen — and purge this
   // account's data exactly like a sign-out (VC-013), so the NEXT sign-in on this device (which
-  // may be a different phone number entirely) never inherits it. The device key is kept, so a
-  // later cold-launch can still silent-relogin if the session was merely stale.
+  // may be a different phone number entirely) never inherits it. The device key AND device id
+  // are kept, so a silent relogin can still reach the server (VC-014) if the session was merely
+  // stale rather than genuinely over.
   sessionExpired: () => {
     purgeAccountData();
     set({ state: 'signed_out', accountId: null, sessionId: null, phone: null });
+    // VC-014: try to recover NOW, while the app is warm, instead of only on the next cold
+    // start — see attemptSilentRelogin's own comment for why this is safe to attempt
+    // unconditionally (a no-op when there is no device key).
+    void attemptSilentRelogin();
   },
 }));
