@@ -47,12 +47,7 @@ export { classifySendFailure } from './sendFailurePolicy';
 export { shouldProbeGap } from './gapDetection';
 export type { GapProbeInput } from './gapDetection';
 export type { SendFailureDecision } from './sendFailurePolicy';
-export {
-  reconcileDecision,
-  backoffMs,
-  nextOutboxRetry,
-  MAX_SEND_ATTEMPTS,
-} from './syncLogic';
+export { reconcileDecision, backoffMs } from './syncLogic';
 export type { ReconcileAction, BackoffOptions } from './syncLogic';
 export {
   searchConversations,

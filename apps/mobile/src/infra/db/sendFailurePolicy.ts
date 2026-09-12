@@ -45,6 +45,14 @@ export function classifySendFailure(
     case 'timeout':
     case 'server':
       return { permanent: false, pauseDrain: true, cooldownMs: 0 };
+    // VC-023: `auth` (401/403 AFTER a refresh already failed) is a SESSION problem, not a
+    // message problem — every other queued item shares the exact same bad session. Treating it
+    // like `client` (below) let the drain keep walking, so one 401 painted the WHOLE outbox
+    // red. Pausing here — same as an unreachable server — means the drain resumes once the
+    // session recovers (a later successful refresh, or the user signing back in) instead of
+    // permanently failing messages nothing was actually wrong with.
+    case 'auth':
+      return { permanent: false, pauseDrain: true, cooldownMs: 0 };
     case 'rate_limit':
       return {
         permanent: false,

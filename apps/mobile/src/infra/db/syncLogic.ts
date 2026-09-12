@@ -48,18 +48,3 @@ export function backoffMs(attempt: number, opts: BackoffOptions = {}): number {
   const half = exp / 2;
   return Math.round(half + rand() * half);
 }
-
-/** Max send attempts before an outbox item is surfaced as permanently failed (§L6). */
-export const MAX_SEND_ATTEMPTS = 8;
-
-/**
- * After a failed send, decide whether the item retries or is permanently failed. `attempts`
- * is the count AFTER incrementing for this failure. Permanent → the send UI surfaces a
- * manual retry (§L6 "permanent → surface retry UI").
- */
-export function nextOutboxRetry(
-  attempts: number,
-  maxAttempts: number = MAX_SEND_ATTEMPTS,
-): { state: 'queued' | 'failed' } {
-  return { state: attempts >= maxAttempts ? 'failed' : 'queued' };
-}

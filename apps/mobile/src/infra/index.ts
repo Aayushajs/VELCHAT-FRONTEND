@@ -98,8 +98,6 @@ export {
   classifySendFailure,
   shouldProbeGap,
   backoffMs,
-  nextOutboxRetry,
-  MAX_SEND_ATTEMPTS,
   searchConversations,
   searchMessages,
   fetchConversationNames,

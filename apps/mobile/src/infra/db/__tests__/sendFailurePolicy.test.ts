@@ -49,7 +49,7 @@ describe('classifySendFailure', () => {
   });
 
   describe('the message itself is unacceptable', () => {
-    it.each(['client', 'auth'])(
+    it.each(['client'])(
       '%s → permanent, surface retry UI immediately',
       kind => {
         const d = classifySendFailure(err(kind), 1);
@@ -61,6 +61,21 @@ describe('classifySendFailure', () => {
 
     it('keeps draining the other conversations', () => {
       expect(classifySendFailure(err('client'), 1).pauseDrain).toBe(false);
+    });
+  });
+
+  // VC-023: `auth` (401/403 AFTER a refresh already failed — see errors.ts's `AppErrorKind`
+  // comment) used to be grouped with `client` above, as if the MESSAGE were what got rejected.
+  // It isn't — the SESSION is what's bad, and every OTHER queued message shares that exact same
+  // session. With `pauseDrain:false` the walk continued into the next item, which hit the same
+  // 401, and so on: one transient auth hiccup painted the entire outbox red. client.ts itself
+  // says a refresh that couldn't reach the server leaves the session valid and must surface a
+  // RETRYABLE error — the policy must agree, not destroy the whole queue on the first one.
+  describe('the session, not the message, is the problem', () => {
+    it('auth → NOT permanent, pauses the drain instead of destroying every queued message', () => {
+      const d = classifySendFailure(err('auth'), 1);
+      expect(d.permanent).toBe(false);
+      expect(d.pauseDrain).toBe(true);
     });
   });
 });

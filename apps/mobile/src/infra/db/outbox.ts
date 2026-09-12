@@ -1,7 +1,9 @@
 /**
  * Outbox DB writers (§L6) — the durable send queue. Thin persistence around the PURE
- * decision logic in `syncLogic.ts` (`nextOutboxRetry` + `backoffMs`); this file only reads/
- * writes rows, it holds NO policy of its own.
+ * decision logic in `syncLogic.ts` (`backoffMs`); this file only reads/writes rows, it
+ * holds NO policy of its own — the queued-vs-failed verdict is `sendFailurePolicy.ts`'s
+ * `classifySendFailure()`, passed in as `permanent` (VC-029: attempt count alone never
+ * decides this — see `markFailed` below).
  *
  * Ordering contract: per-conversation FIFO with single-flight. `claimNextDue` only ever
  * hands out the head-of-line item of a conversation (oldest `created_at`), and never a
@@ -13,7 +15,7 @@ import { Q } from '@nozbe/watermelondb';
 import { getDatabase } from './database';
 import { Outbox, Message, Conversation } from './models';
 import { newClientMsgId, nextLocalStamp } from './messages';
-import { backoffMs, nextOutboxRetry } from './syncLogic';
+import { backoffMs } from './syncLogic';
 import type { SendMessageInput } from '../network/chat';
 
 /** The kind stored on a text/message send row (the schema `kind` column). */
@@ -254,23 +256,27 @@ export function markAckd(id: string): Promise<void> {
 }
 
 /**
- * Record a failed send. `attempts` is the count AFTER incrementing for this failure.
- * `nextOutboxRetry` decides queued-with-backoff vs permanently failed (§L6); backoff uses
- * the shared full-jitter schedule so a fleet doesn't retry in lockstep.
+ * Record a failed send. `attempts` is the count AFTER incrementing for this failure, used only
+ * for the backoff schedule — never for the queued-vs-failed verdict (§L6). `permanent` decides
+ * that verdict and is REQUIRED (VC-029: this used to default to an attempt-count threshold when
+ * omitted, but nothing calls it that way — every real site classifies the CAUSE via
+ * `classifySendFailure()` first, so a silent attempts-based fallback was unreachable dead code
+ * that its own tests were the only thing exercising).
  */
 export function markFailed(
   id: string,
   error: string,
   attempts: number,
   /**
-   * Override the attempt-count verdict with the CAUSE of the failure.
+   * The CAUSE of the failure, already classified.
    *
    * Attempts alone are the wrong signal: eight failures because the phone is in a tunnel say
    * nothing bad about the message, while one 400 says everything. `false` keeps the row retrying
-   * (clock icon, WhatsApp behaviour); `true` retires it immediately so the user gets the retry
-   * affordance now instead of after eight pointless replays of a rejected payload.
+   * (clock icon, WhatsApp behaviour) — including past any attempt count, since a tunnel is not a
+   * bad message; `true` retires it immediately so the user gets the retry affordance now instead
+   * of after pointless replays of a rejected payload.
    */
-  permanent?: boolean,
+  permanent: boolean,
 ): Promise<void> {
   return withOutboxLock(async () => {
     const db = getDatabase();
@@ -278,12 +284,7 @@ export function markFailed(
     const row = await col.find(id).catch(() => null);
     if (!row) return;
     const now = Date.now();
-    const state =
-      permanent === undefined
-        ? nextOutboxRetry(attempts).state
-        : permanent
-          ? 'failed'
-          : 'queued';
+    const state = permanent ? 'failed' : 'queued';
     const retryAt = state === 'queued' ? now + backoffMs(attempts) : undefined;
     await db.write(async () => {
       await row.update(o => {

@@ -770,7 +770,7 @@
       "title": "One 401 on send turns the entire outbox into permanently failed messages",
       "severity": "P1",
       "priority": "P1",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Messaging / Outbox",
       "component": "apps/mobile/src/infra/db/sendFailurePolicy.ts:59-61 + domain/sync/SyncEngine.ts:1155-1161",
@@ -797,8 +797,9 @@
         "apps/mobile/src/infra/db/__tests__/sendFailurePolicy.test.ts:52"
       ],
       "regression": false,
-      "notes": "",
-      "jira": "VC-23"
+      "notes": "FIX: classifySendFailure() grouped auth with client, treating a post-refresh-failure 401/403 as if THIS message were rejected (permanent:true, pauseDrain:false) — one transient auth hiccup then permanently failed every other queued message as the drain kept walking into the same 401. auth is a SESSION problem, not a message problem (client.ts already treats a refresh that cannot reach the server as retryable, leaving the session valid). Added a dedicated auth case returning {permanent:false, pauseDrain:true, cooldownMs:0}, matching the network/timeout/server treatment, so the drain pauses instead of destroying the queue and resumes once the session recovers. Split the existing it.each(['client','auth']) test (which encoded the old, wrong grouping) into client-only plus a new dedicated describe block for auth. Verified: full jest suite 452/452 pass, tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-23",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-024",
@@ -972,7 +973,7 @@
       "title": "Outbox backoff exhaustion is unreachable — MAX_SEND_ATTEMPTS can never fire",
       "severity": "P2",
       "priority": "P2",
-      "status": "Open",
+      "status": "Fixed",
       "layer": "CLIENT",
       "feature": "Messaging / Outbox",
       "component": "apps/mobile/src/infra/db/outbox.ts:281-286 + domain/sync/SyncEngine.ts:1156",
@@ -998,8 +999,9 @@
         "apps/mobile/src/infra/db/__tests__/syncLogic.test.ts:96-113"
       ],
       "regression": false,
-      "notes": "Two existing tests cover code that cannot run in production.",
-      "jira": "VC-29"
+      "notes": "FIX: removed the dead attempt-count exhaustion path (MAX_SEND_ATTEMPTS/nextOutboxRetry in syncLogic.ts) that markFailed() fell back to only when permanent was omitted — a fallback no real call site ever triggered (SyncEngine.ts always passes a classified boolean from classifySendFailure()). This mechanism contradicted the documented WhatsApp-style policy (sendFailurePolicy.ts: reachability failures retry forever, never auto-fail by attempt count) and had no basis in the HLD/LLD spec (§L6 outbox semantics: classification-based retryable-vs-permanent only, no attempt cap). Made markFailed()'s permanent parameter required (compiler now prevents the dead path from ever coming back), updated the one test that accidentally relied on the old default (realtime-hardening.test.ts) to pass permanent explicitly, removed the 4 tests for the deleted dead function, and added a new regression test proving a retryable cause stays queued past a high attempt count. Verified: full jest suite 452/452 pass (455 - 4 removed + 1 added), tsc --noEmit clean, eslint 0 errors.",
+      "jira": "VC-29",
+      "fixedIn": "dev branch, 2026-09-12"
     },
     {
       "id": "VC-030",

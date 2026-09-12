@@ -1,17 +1,14 @@
 /**
  * Pure sync/outbox decision logic (§L6) — unit-tested WITHOUT a DB (the SQLite adapter is
  * mocked under Jest, so any getDatabase()-touching code can't run here). These lock in the
- * three contracts the DB writers + engine depend on:
+ * two contracts the DB writers + engine depend on:
  *   - reconcile branch precedence (client_msg_id → seq → insert),
- *   - full-jitter backoff bounds + injectable determinism (no lockstep reconnects),
- *   - the permanent-failure threshold that flips a send to the retry-UI state.
+ *   - full-jitter backoff bounds + injectable determinism (no lockstep reconnects).
+ *
+ * The queued-vs-permanently-failed verdict itself is NOT decided here (VC-029): that's
+ * `sendFailurePolicy.ts`'s `classifySendFailure()`, covered by its own test file.
  */
-import {
-  reconcileDecision,
-  backoffMs,
-  nextOutboxRetry,
-  MAX_SEND_ATTEMPTS,
-} from '../syncLogic';
+import { reconcileDecision, backoffMs } from '../syncLogic';
 
 describe('reconcileDecision (§L6 dedup)', () => {
   test('own echo: a matching client_msg_id row → UPDATE (wins over seq)', () => {
@@ -90,26 +87,5 @@ describe('backoffMs (§M8/§L4 full-jitter, capped)', () => {
       expect(v).toBeLessThanOrEqual(5000);
       expect(v).toBeGreaterThanOrEqual(2499);
     }
-  });
-});
-
-describe('nextOutboxRetry (§L6 permanent-failure threshold)', () => {
-  test('below the max → keep retrying (queued)', () => {
-    expect(nextOutboxRetry(1).state).toBe('queued');
-    expect(nextOutboxRetry(MAX_SEND_ATTEMPTS - 1).state).toBe('queued');
-  });
-
-  test('at/above the max → permanently failed (surface retry UI)', () => {
-    expect(nextOutboxRetry(MAX_SEND_ATTEMPTS).state).toBe('failed');
-    expect(nextOutboxRetry(MAX_SEND_ATTEMPTS + 3).state).toBe('failed');
-  });
-
-  test('respects a custom max', () => {
-    expect(nextOutboxRetry(2, 3).state).toBe('queued');
-    expect(nextOutboxRetry(3, 3).state).toBe('failed');
-  });
-
-  test('default threshold is 8', () => {
-    expect(MAX_SEND_ATTEMPTS).toBe(8);
   });
 });

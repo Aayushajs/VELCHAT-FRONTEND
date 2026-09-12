@@ -160,8 +160,9 @@ describe('Realtime & Offline-First Hardening Suite', () => {
       const item = await claimNextDue(Date.now() + 1000);
       expect(item).not.toBeNull();
 
-      // Mark permanently failed (attempts = 8)
-      await markFailed(item!.id, 'Network error 503', 8);
+      // Mark permanently failed — the policy decision (VC-029: attempt count alone never
+      // decides this; see sendFailurePolicy.ts), not merely "8 attempts happened".
+      await markFailed(item!.id, 'Network error 503', 8, true);
 
       // Simulate manual retry
       const requeued = await requeueFailed(clientMsgId!);
@@ -183,6 +184,37 @@ describe('Realtime & Offline-First Hardening Suite', () => {
       expect(msgs[0]!.clientMsgId).toBe(clientMsgId);
       expect(msgs[0]!.seq).toBe(200);
       expect(msgs[0]!.state).toBe('sent');
+    });
+
+    test('VC-029: a retryable cause stays queued no matter how many attempts have piled up', async () => {
+      // The exact defect: markFailed used to fall back to an attempt-count threshold (8) when
+      // `permanent` was omitted, so a message could be auto-failed by attempt count alone —
+      // contradicting sendFailurePolicy.ts's own contract that a reachability problem (the
+      // phone in a tunnel, say) retries forever and is never the message's fault. `permanent`
+      // is now a required, explicit policy decision; passing `false` at a high attempt count
+      // must still leave the row queued for another try.
+      const clientMsgId = await sendMessageLocal(
+        convId,
+        'Stuck behind a bad connection',
+        meId,
+      );
+      await enqueueSend(convId, clientMsgId!, {
+        conversationId: convId,
+        senderId: meId,
+        clientMsgId: clientMsgId!,
+        content: 'Stuck behind a bad connection',
+      });
+      const item = await claimNextDue(Date.now() + 1000);
+      expect(item).not.toBeNull();
+
+      await markFailed(item!.id, 'Network error 503', 99, false);
+
+      const requeued = await requeueFailed(clientMsgId!);
+      // requeueFailed only ever matches state:'failed' rows — false proves this one is NOT
+      // failed, i.e. it stayed in the retry queue despite the high attempt count.
+      expect(requeued).toBe(false);
+      const stats = await outboxStats();
+      expect(stats.queued).toBeGreaterThan(0);
     });
   });
 
