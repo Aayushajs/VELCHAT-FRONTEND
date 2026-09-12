@@ -91,11 +91,32 @@ const OUTBOX_MAX_DELAY_MS = 30_000;
  */
 const MAX_AUTH_REFRESH_ATTEMPTS = 2;
 /**
+ * Safety ceiling on how many pages `fetchOlderMessages` will step back over in ONE call while
+ * searching for the first non-deleted page (VC-027). Real deletion runs are nowhere near this
+ * wide; it exists purely so a pathological/corrupt history can't turn one scroll gesture into an
+ * unbounded request storm — it still returns `false` (today's exact behaviour) in that case
+ * rather than hang.
+ */
+const MAX_HOLE_HOPS = 200;
+/**
  * Receipts are coalesced over this window before going out. A burst of inbound messages must cost
  * ONE cumulative frame, not one per message: the gateway drops inbound frames above ~40/sec per
  * connection, silently and shared, so a chatty group could otherwise starve `read` and `sync`.
  */
 const RECEIPT_FLUSH_DELAY_MS = 250;
+/**
+ * Per-tick ceiling on receipt frames `flushReceipts` will emit (VC-025). Kept well under the
+ * gateway's ~40/sec inbound budget deliberately: receipts share that budget with everything else
+ * on the connection (outbox sends, typing), so a reassert must leave room rather than claim it
+ * all for itself.
+ */
+const MAX_RECEIPT_FRAMES_PER_FLUSH = 20;
+/**
+ * Gap between chunks of an over-budget flush — comfortably longer than the gateway's own
+ * per-second window, so consecutive chunks land in SEPARATE rate-limit windows instead of one
+ * burst split across two ticks that still lands in the same second.
+ */
+const RECEIPT_FLUSH_CHUNK_DELAY_MS = 1100;
 /**
  * Conversations backfilled concurrently on reconnect. Sequential catch-up leaves a 500-chat user
  * "syncing" for minutes; unbounded fan-out is a self-inflicted burst against the edge limiter.
@@ -884,43 +905,65 @@ class SyncEngine {
     }
   }
 
-  private scheduleReceiptFlush(): void {
+  private scheduleReceiptFlush(delayMs: number = RECEIPT_FLUSH_DELAY_MS): void {
     if (this.stopped || this.suspended || this.receiptTimer !== null) return;
     this.receiptTimer = setTimeout(() => {
       this.receiptTimer = null;
       void this.flushReceipts();
-    }, RECEIPT_FLUSH_DELAY_MS);
+    }, delayMs);
   }
 
   /**
-   * Emit the receipts still owed, one cumulative frame per state per conversation.
+   * Emit the receipts still owed, one cumulative frame per state per conversation — CHUNKED to
+   * stay under the gateway's shared inbound budget (VC-025).
    *
    * `sent` advances ONLY when the transport accepted the frame. The socket drops sends silently
    * when it isn't OPEN, so treating "we tried" as "they know" is exactly how a receipt vanishes
    * into a reconnect. Anything unsent stays dirty and is re-derived on the next flush — which the
    * reconnect path triggers, so a dropped frame costs one extra frame, never a stuck tick.
+   *
+   * A reconnect after any real gap can mark DOZENS of conversations dirty at once
+   * (`reassertReceipts`), and the old code sent every resulting frame in one synchronous tick.
+   * The gateway drops inbound frames past ~40/sec per connection, silently — so that burst
+   * self-inflicts exactly the backpressure this coalescing exists to avoid, and the client never
+   * learns which frames were dropped (a bare `socket.send()` only checks `readyState`). Capping
+   * frames per tick and rescheduling the rest, further apart than the gateway's own window,
+   * spreads a big reassert across several ticks instead of racing the rate limiter.
    */
   private flushReceipts(): void {
     if (this.stopped) return;
     const ids = takeDirty();
     if (ids.length === 0) return;
+    let sentFrames = 0;
+    let overBudget = false;
     for (const conversationId of ids) {
+      if (overBudget) {
+        markDirty(conversationId); // untouched this tick — catch it on the next chunk
+        continue;
+      }
       const desired = getDesired(conversationId);
       const frames = pendingReceiptFrames(desired, getSent(conversationId));
       if (frames.length === 0) continue;
       for (const f of frames) {
+        if (sentFrames >= MAX_RECEIPT_FRAMES_PER_FLUSH) {
+          markDirty(conversationId);
+          overBudget = true;
+          break;
+        }
         const ok = this.socket?.send(f.state, {
           conversationId,
           seq: f.upToSeq,
         });
         if (ok) {
           noteSent(conversationId, { [f.state]: f.upToSeq });
+          sentFrames += 1;
         } else {
           // Socket down or backpressured — keep it owed and retry on the next flush/reconnect.
           markDirty(conversationId);
         }
       }
     }
+    if (overBudget) this.scheduleReceiptFlush(RECEIPT_FLUSH_CHUNK_DELAY_MS);
   }
 
   /**
@@ -1277,14 +1320,25 @@ class SyncEngine {
     conversationId: string,
     page: number,
   ): Promise<boolean> {
-    const oldest = await minSeqForConversation(conversationId);
-    if (oldest <= 1) return false; // seq 1 is the first message ever — nothing precedes it
-    const from = Math.max(0, oldest - 1 - page);
-    const older = await fetchMessagesAfter(conversationId, from, page);
-    const fresh = older.filter(m => m.seq < oldest);
-    if (fresh.length === 0) return false;
-    await applyServerMessages(fresh);
-    return true;
+    // The backend's history filters `deleted:false`, so a contiguous deleted run WIDER than one
+    // page comes back completely empty — that means "nothing non-deleted in this window", not
+    // "nothing older exists". Treating it as end-of-history stranded the UI permanently: the
+    // window never grows, so there is no further "scrolled past the oldest bubble" event left to
+    // retry with (VC-027). Step back over the hole instead, page by page, until a page actually
+    // has something in it or we truly reach the start of the conversation.
+    let oldest = await minSeqForConversation(conversationId);
+    for (let hop = 0; hop < MAX_HOLE_HOPS; hop++) {
+      if (oldest <= 1) return false; // seq 1 is the first message ever — nothing precedes it
+      const from = Math.max(0, oldest - 1 - page);
+      const older = await fetchMessagesAfter(conversationId, from, page);
+      const fresh = older.filter(m => m.seq < oldest);
+      if (fresh.length > 0) {
+        await applyServerMessages(fresh);
+        return true;
+      }
+      oldest = from + 1; // this whole window was a hole — the next hop starts just before it
+    }
+    return false;
   }
 
   /**

@@ -147,7 +147,7 @@ import {
   upsertConversation,
 } from '../../../infra/db/queries';
 import { applyServerMessages } from '../../../infra/db/messages';
-import { clearAllReceipts } from '../../../infra/db/receiptStore';
+import { clearAllReceipts, noteDesired } from '../../../infra/db/receiptStore';
 import { kv, KVKeys } from '../../../infra/kv';
 import { AppError } from '../../../infra/network/errors';
 
@@ -1071,6 +1071,42 @@ describe('read receipts', () => {
   });
 });
 
+// ── 8b. receipt reassertion on reconnect must respect the gateway's inbound budget (VC-025) ──
+
+describe('receipt reassertion after a reconnect with many owed conversations', () => {
+  const COUNT = 60; // well past the gateway's ~40/sec inbound budget (ws-fabric.ts)
+
+  beforeEach(() => {
+    for (let i = 0; i < COUNT; i++) {
+      noteDesired(`owed_${i}`, { read: 5 });
+    }
+  });
+
+  function receiptFramesSent(socket: MockSocket): number {
+    return socket.sent.filter(f => f.type === 'read' || f.type === 'delivered')
+      .length;
+  }
+
+  it('does not dump every owed receipt in one unchunked burst', async () => {
+    const socket = await bootConnected();
+
+    // The FIRST synchronous flush (onConnected -> reassertReceipts -> flushReceipts) must stay
+    // within budget — the exact defect was one frame per owed conversation in a single tick.
+    expect(receiptFramesSent(socket)).toBeLessThan(COUNT);
+    expect(receiptFramesSent(socket)).toBeGreaterThan(0);
+  });
+
+  it('eventually sends every owed receipt across later chunks — nothing is silently dropped', async () => {
+    const socket = await bootConnected();
+
+    await until(
+      () => receiptFramesSent(socket) === COUNT,
+      'every owed conversation to be reasserted, across as many chunks as it takes',
+      10_000,
+    );
+  });
+});
+
 // ── 9. pagination: load older never duplicates, loses or reorders ────────────
 
 describe('loading older history', () => {
@@ -1135,6 +1171,49 @@ describe('loading older history', () => {
     const seqs = rows.map(r => r.seq ?? 0);
     expect(new Set(seqs).size).toBe(seqs.length);
     expect(seqs).toEqual([...seqs].sort((x, y) => x - y));
+  });
+});
+
+// ── 9b. a deletion hole wider than one page must not dead-end pagination (VC-027) ────
+
+describe('loading older history across a wide deletion hole', () => {
+  const conv = 'hole_conv';
+  const PAGE = 50;
+
+  beforeEach(async () => {
+    await upsertConversation(conv, { type: 'dm', name: 'Peer' });
+    // seq 1..20 and 91..120 exist; 21..90 (70 messages — wider than one page) are deleted, so
+    // the server never returns them at all (exactly like chat.repository.ts's deleted:false
+    // filter — the mock just omits them from serverHistory rather than modelling a flag).
+    const present = [
+      ...Array.from({ length: 20 }, (_, i) => serverMsg(conv, i + 1)),
+      ...Array.from({ length: 30 }, (_, i) => serverMsg(conv, i + 91)),
+    ];
+    serverHistory.set(conv, present);
+  });
+
+  it('steps over the hole instead of reporting end-of-history', async () => {
+    await applyServerMessages(
+      (serverHistory.get(conv) ?? []).filter(m => m.seq >= 91),
+    );
+    expect(await messagesOf(conv)).toHaveLength(30); // holds 91..120
+
+    // ONE call must reach past the 70-wide hole — the UI has no way to trigger a second
+    // attempt when the window did not grow (§useMessages.ts: no new "scrolled past the
+    // oldest bubble" event without new rows).
+    const grew = await syncEngine.loadOlderMessages(conv, PAGE);
+
+    expect(grew).toBe(true);
+    const rows = await rowsBySeq(conv);
+    expect(rows.map(r => r.seq)).toEqual([
+      ...Array.from({ length: 20 }, (_, i) => i + 1),
+      ...Array.from({ length: 30 }, (_, i) => i + 91),
+    ]);
+  });
+
+  it('still reports genuine end-of-history once nothing precedes what remains', async () => {
+    await applyServerMessages(serverHistory.get(conv) ?? []); // everything reachable is held
+    expect(await syncEngine.loadOlderMessages(conv, PAGE)).toBe(false);
   });
 });
 
